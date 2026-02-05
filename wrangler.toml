@@ -1,0 +1,36 @@
+name = "market-iq"
+main = "src/worker.ts"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"] # not using node, but keeps some polyfills available
+
+# Bindings
+[[kv_namespaces]]
+binding = "MARKETIQ_KV"
+id = "REPLACE_WITH_KV_ID"
+# For previews (wrangler dev)
+preview_id = "REPLACE_WITH_KV_PREVIEW_ID"
+
+[vars]
+BOT_NAME = "Market IQ"
+FREE_DAILY_LIMIT = "50"
+FREE_MONTHLY_LIMIT = "500"
+SUB_DAILY_LIMIT = "50"
+DEFAULT_SUB_PRICE_USDT = "2"
+DEFAULT_SUB_DAYS = "30"
+REF_POINTS_SUCCESS = "6"
+SUB_POINTS_COST = "1000"
+COMMISSION_BASE = "0.04"
+COMMISSION_MAX = "0.20"
+BANNER_ON = "false"
+BANNER_TEXT = ""
+BANNER_URL = ""
+
+# Cron triggers
+[triggers]
+crons = [
+  "*/5 * * * *",   # process custom prompt queue, housekeeping
+  "0 0 * * *"      # midnight reset for daily counters (UTC)
+]
+
+# You may set route or use "wrangler deploy" to workers.dev
+# routes = [{ pattern = "yourdomain.com/*", zone_id = "YOUR_ZONE_ID" }]
