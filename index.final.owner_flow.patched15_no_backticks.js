@@ -195,72 +195,86 @@ export default {
         return jsonResponse({ ok: true, state: stPublic(st), quota });
       }
 
-if (url.pathname === "/api/analyze" && request.method === "POST") {
-  const body = await request.json().catch(() => null);
-  if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+      if (url.pathname === "/api/analyze" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-  const v = await authMiniApp(body, env);
-  if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
+        const v = await authMiniApp(body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
 
-  const st = await ensureUser(v.userId, env, v.fromLike);
-  if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
 
-  const symbol = normalizeSymbol(body.symbol);
-  if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+        const symbol = normalizeSymbol(body.symbol);
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-  // quota check (subscription-aware)
-  if (env.BOT_KV && !(await canAnalyzeToday(st, v.fromLike, env))) {
-    const quota = await quotaText(st, v.fromLike, env);
-    return jsonResponse({ ok: false, error: "quota_exceeded", quota }, 429);
-  }
+        // quota check (subscription-aware)
+        if (env.BOT_KV && !(await canAnalyzeToday(st, v.fromLike, env))) {
+          const quota = await quotaText(st, v.fromLike, env);
+          return jsonResponse({ ok: false, error: "quota_exceeded", quota }, 429);
+        }
 
-  const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
+        const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
-  try {
-    // Run analysis first (don't consume quota on failure)
-    const out = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
+        try {
+          // Run analysis first (don't consume quota on failure)
+          const out = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
 
-    if (env.BOT_KV && out && out.ok) {
-      await consumeDaily(st, v.fromLike, env);
-      await saveUser(v.userId, st, env);
-    }
+          if (!out || !out.ok) {
+            const quota = await quotaText(st, v.fromLike, env);
+            return jsonResponse(
+              {
+                ok: false,
+                error: "analysis_failed",
+                message: out?.text || "تحلیل ناموفق بود.",
+                dataProvider: out?.dataProvider || "",
+                quota,
+              },
+              502
+            );
+          }
 
-    const quota = await quotaText(st, v.fromLike, env);
-    return jsonResponse({
-      ok: true,
-      result: out?.text || "",
-      chartUrl: out?.chartUrl || "",
-      headlines: out?.headlines || [],
-      modelJson: out?.plan || null,
-      state: stPublic(st),
-      quota,
-    });
-  } catch (e) {
-    console.error("api/analyze error:", e);
+          if (env.BOT_KV) {
+            await consumeDaily(st, v.fromLike, env);
+            await saveUser(v.userId, st, env);
+          }
 
-    const msg = String(e?.message || "");
-    let code = "try_again";
-    if (
-      msg.includes("AI_binding_missing") ||
-      msg.includes("OPENAI_API_KEY_missing") ||
-      msg.includes("GEMINI_API_KEY_missing") ||
-      msg.includes("all_text_providers_failed")
-    ) code = "ai_not_configured";
-    else if (
-      msg.includes("market_data") ||
-      msg.includes("binance_") ||
-      msg.includes("yahoo_") ||
-      msg.includes("twelvedata_") ||
-      msg.includes("finnhub_") ||
-      msg.includes("alphavantage_")
-    ) code = "market_data_unavailable";
+          const quota = await quotaText(st, v.fromLike, env);
+          return jsonResponse({
+            ok: true,
+            result: out?.text || "",
+            chartUrl: out?.chartUrl || "",
+            headlines: out?.headlines || [],
+            modelJson: out?.plan || null,
+            state: stPublic(st),
+            quota,
+          });
+        } catch (e) {
+          console.error("api/analyze error:", e);
 
-    const quota = await quotaText(st, v.fromLike, env).catch(() => "-");
-    const payload = { ok: false, error: code, quota };
-    if (isPrivileged(v.fromLike, env)) payload.debug = e?.message || String(e);
-    return jsonResponse(payload, 500);
-  }
-}
+          const msg = String(e?.message || "");
+          let code = "try_again";
+          if (
+            msg.includes("AI_binding_missing") ||
+            msg.includes("OPENAI_API_KEY_missing") ||
+            msg.includes("GEMINI_API_KEY_missing") ||
+            msg.includes("all_text_providers_failed")
+          ) code = "ai_not_configured";
+          else if (
+            msg.includes("market_data") ||
+            msg.includes("binance_") ||
+            msg.includes("yahoo_") ||
+            msg.includes("twelvedata_") ||
+            msg.includes("finnhub_") ||
+            msg.includes("alphavantage_")
+          ) code = "market_data_unavailable";
+
+          const quota = await quotaText(st, v.fromLike, env).catch(() => "-");
+          const payload = { ok: false, error: code, quota };
+          if (isPrivileged(v.fromLike, env)) payload.debug = e?.message || String(e);
+          return jsonResponse(payload, 500);
+        }
+      }
 
 
 
@@ -5075,7 +5089,7 @@ async function authMiniApp(body, env) {
   // Use ?dev=1 in the Mini App URL; the frontend will send {dev:true,userId:"..."}.
   if (body && body.dev === true && String(env.DEV_MODE || "") === "1") {
     const uid = String(body.userId || "999000").trim() || "999000";
-    return { ok: true, userId: uid, fromLike: { username: "dev" }, dev: true };
+    return { ok: true, userId: uid, fromLike: { username: "dev", id: uid }, dev: true };
   }
   const ttl = Number(env.TELEGRAM_INITDATA_TTL_SEC || 21600);
   return verifyTelegramInitData(body?.initData, env.TELEGRAM_BOT_TOKEN, ttl);
