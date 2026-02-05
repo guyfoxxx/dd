@@ -4174,15 +4174,20 @@ ${st.levelSummary || "—"}
     // Settings menu actions
     if(text===BTN.SET_TF){ st.state="set_tf"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⏱ تایم‌فریم:", optionsKeyboard(["M15","H1","H4","D1"])); }
     if(text===BTN.SET_STYLE){
-  st.state="set_style";
-  await saveUser(userId, st, env);
-  const cat = await getStyleCatalog(env);
-  const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
-  if(!labels.length){ return tgSendMessage(env, chatId, "⚠️ هیچ سبک فعالی توسط ادمین تنظیم نشده است.
-
-لطفاً بعداً تلاش کن یا از ادمین بخواه سبک اضافه کند.", mainMenuKeyboard(env)); }
-  return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(labels));
-}
+      st.state="set_style";
+      await saveUser(userId, st, env);
+      const cat = await getStyleCatalog(env);
+      const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
+      if(!labels.length){
+        return tgSendMessage(
+          env,
+          chatId,
+          "⚠️ هیچ سبک فعالی توسط ادمین تنظیم نشده است.\n\nلطفاً بعداً تلاش کن یا از ادمین بخواه سبک اضافه کند.",
+          mainMenuKeyboard(env)
+        );
+      }
+      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(labels));
+    }
     if(text===BTN.SET_RISK){ st.state="set_risk"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⚠️ ریسک:", optionsKeyboard(["کم","متوسط","زیاد"])); }
     if(text===BTN.SET_NEWS){ st.state="set_news"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"])); }
 
@@ -4199,7 +4204,7 @@ ${st.levelSummary || "—"}
       st.state="idle";
       await saveUser(userId, st, env);
       return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env));
-    }`, mainMenuKeyboard(env)); }
+    }
     if(st.state==="set_risk"){ const v=sanitizeRisk(text); if(!v) return tgSendMessage(env, chatId, "یکی از گزینه‌ها را انتخاب کن:", optionsKeyboard(["کم","متوسط","زیاد"])); st.risk=v; st.state="idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if(st.state==="set_news"){ const v=sanitizeNewsChoice(text); if(v===null) return tgSendMessage(env, chatId, "یکی از گزینه‌ها را انتخاب کن:", optionsKeyboard(["روشن ✅","خاموش ❌"])); st.newsEnabled=v; st.state="idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
 
@@ -4219,8 +4224,17 @@ if(isSymbol(text)){
   const cat = await getStyleCatalog(env);
   const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
 
-  if(!labels.length){ st.state="idle"; st.selectedSymbol=""; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⚠️ فعلاً هیچ سبک فعالی برای تحلیل وجود ندارد.
-از ادمین بخواه سبک‌ها را فعال کند.", mainMenuKeyboard(env)); }
+  if(!labels.length){
+    st.state="idle";
+    st.selectedSymbol="";
+    await saveUser(userId, st, env);
+    return tgSendMessage(
+      env,
+      chatId,
+      "⚠️ فعلاً هیچ سبک فعالی برای تحلیل وجود ندارد.\nاز ادمین بخواه سبک‌ها را فعال کند.",
+      mainMenuKeyboard(env)
+    );
+  }
   return tgSendMessage(env, chatId, `🧩 مرحله ۳: سبک تحلیل را انتخاب کن (نماد: ${symbol})`, optionsKeyboard(labels));
 }
 
