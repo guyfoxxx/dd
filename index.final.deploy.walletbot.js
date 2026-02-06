@@ -828,13 +828,12 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
         headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
         return new Response(obj.body, { status: 200, headers });
       }
-// ===== Telegram webhook route: /telegram/<secret> =====
+      // ===== Telegram webhook route: /telegram =====
       // نکته: تلگرام ریدایرکت (3xx) را قبول نمی‌کند؛ پس این مسیر باید مستقیم 200 بدهد.
       // برای تست در مرورگر/پروکسی: GET/HEAD/OPTIONS همیشه 200 + ok (بدون نیاز به secret).
       {
         const p = url.pathname.replace(/\/+$/g, "");
-        if (p.startsWith("/telegram/")) {
-          const secret = p.split("/")[2] || "";
+        if (p === "/telegram") {
           const m = request.method;
 
           const okHeaders = {
@@ -842,7 +841,7 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
             "cache-control": "no-store",
             "access-control-allow-origin": "*",
             "access-control-allow-methods": "POST, GET, OPTIONS",
-            "access-control-allow-headers": "content-type",
+            "access-control-allow-headers": "content-type, x-telegram-bot-api-secret-token",
           };
 
           // Browser/proxy preflight checks: always OK
@@ -850,10 +849,13 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
             return new Response("ok", { status: 200, headers: okHeaders });
           }
 
-          // Only POST is a real Telegram update; require secret for POST.
-          const expected = String(env.TELEGRAM_WEBHOOK_SECRET || "Admin");
-          if (secret !== expected) {
-            return new Response("forbidden", { status: 403, headers: okHeaders });
+          // Only POST is a real Telegram update; require secret header for POST.
+          const expected = String(env.WEBHOOK_SECRET || env.TELEGRAM_WEBHOOK_SECRET || "");
+          if (expected) {
+            const got = String(request.headers.get("x-telegram-bot-api-secret-token") || "").trim();
+            if (!got || got !== expected) {
+              return new Response("forbidden", { status: 403, headers: okHeaders });
+            }
           }
           if (m !== "POST") {
             return new Response("ok", { status: 200, headers: okHeaders });
@@ -5708,6 +5710,12 @@ const MINI_APP_HTML = [
   '          </div>',
   '',
   '          <div style="height:12px"></div>',
+  '          <div class="field">',
+  '            <div class="label">کامنت / توضیح تحلیل</div>',
+  '            <textarea id="comment" class="control" placeholder="اگر توضیح یا درخواست خاصی دارید اینجا بنویسید…" style="min-height:70px"></textarea>',
+  '          </div>',
+  '',
+  '          <div style="height:12px"></div>',
   '',
   '          <div class="actions">',
   '            <button id="save" class="btn">💾 ذخیره</button>',
@@ -5844,6 +5852,7 @@ function fillStyles(list, selectedKeyOrLabel){
   else {
     const byLabel = items.find(x=>x.label===prefer);
     if(byLabel) sel.value = byLabel.key;
+    else sel.value = items[0].key;
   }
 }
 
@@ -6055,7 +6064,6 @@ async function boot(){
   if(el("cpInfo")) el("cpInfo").textContent = json.infoText || "";
   if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: " + (json.customPrompt?.status || "none");
   if (json.state?.timeframe) setTf(json.state.timeframe);
-  if (json.state?.style) setVal("style", json.state.style);
   if (json.state?.risk) setVal("risk", json.state.risk);
   setVal("newsEnabled", String(!!json.state?.newsEnabled));
 
@@ -6110,7 +6118,13 @@ el("analyze").addEventListener("click", async () => {
   out.textContent = "⏳ در حال تحلیل…";
 
   const initData = tg?.initData || "";
-  const payload = { initData, dev: DEV, userId: DEV ? DEV_UID : undefined, symbol: val("symbol"), userPrompt: "" };
+  const payload = {
+    initData,
+    dev: DEV,
+    userId: DEV ? DEV_UID : undefined,
+    symbol: val("symbol"),
+    userPrompt: (val("comment") || "").trim(),
+  };
 
   const {status, json} = await api("/api/analyze", payload);
   if (!json?.ok) {
