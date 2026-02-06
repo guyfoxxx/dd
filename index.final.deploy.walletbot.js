@@ -1,5 +1,31 @@
 // @ts-nocheck
 
+// DOM helper (safe in Workers + Browser)
+if (typeof globalThis.el !== 'function') {
+  globalThis.el = function(id){
+    try {
+      if (typeof document === 'undefined') return null;
+      let e = document.getElementById(id);
+      if (!e) {
+        e = document.createElement('div');
+        e.id = id;
+        e.style.display = 'none';
+        (document.body || document.documentElement).appendChild(e);
+      }
+      return e;
+    } catch { return null; }
+  };
+}
+if (typeof globalThis.$ !== 'function') {
+  globalThis.$ = globalThis.el;
+}
+// Make lexical aliases (Workers modules don't expose global props as vars)
+const el = globalThis.el;
+const $ = globalThis.$;
+
+if (typeof globalThis.DEV === 'undefined') { globalThis.DEV = false; }
+
+
 function parseIdList(x){
   return String(x||"").split(",").map(t=>t.trim()).filter(Boolean);
 }
@@ -36,7 +62,7 @@ function htmlResponse(html, status = 200) {
 function jsResponse(js, status = 200) {
   return new Response(js, {
     status,
-    headers: { "content-type": "application/javascript; charset=utf-8" },
+    headers: { "content-type": "application/javascript; charset=utf-8", "Cache-Control":"no-store, max-age=0", "Pragma":"no-cache" },
   });
 }
 
@@ -195,86 +221,72 @@ export default {
         return jsonResponse({ ok: true, state: stPublic(st), quota });
       }
 
-      if (url.pathname === "/api/analyze" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+if (url.pathname === "/api/analyze" && request.method === "POST") {
+  const body = await request.json().catch(() => null);
+  if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await authMiniApp(body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
+  const v = await authMiniApp(body, env);
+  if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
 
-        const st = await ensureUser(v.userId, env, v.fromLike);
-        if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
+  const st = await ensureUser(v.userId, env, v.fromLike);
+  if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
 
-        const symbol = normalizeSymbol(body.symbol);
-        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+  const symbol = normalizeSymbol(body.symbol);
+  if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // quota check (subscription-aware)
-        if (env.BOT_KV && !(await canAnalyzeToday(st, v.fromLike, env))) {
-          const quota = await quotaText(st, v.fromLike, env);
-          return jsonResponse({ ok: false, error: "quota_exceeded", quota }, 429);
-        }
+  // quota check (subscription-aware)
+  if (env.BOT_KV && !(await canAnalyzeToday(st, v.fromLike, env))) {
+    const quota = await quotaText(st, v.fromLike, env);
+    return jsonResponse({ ok: false, error: "quota_exceeded", quota }, 429);
+  }
 
-        const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
+  const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
-        try {
-          // Run analysis first (don't consume quota on failure)
-          const out = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
+  try {
+    // Run analysis first (don't consume quota on failure)
+    const out = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
 
-          if (!out || !out.ok) {
-            const quota = await quotaText(st, v.fromLike, env);
-            return jsonResponse(
-              {
-                ok: false,
-                error: "analysis_failed",
-                message: out?.text || "تحلیل ناموفق بود.",
-                dataProvider: out?.dataProvider || "",
-                quota,
-              },
-              502
-            );
-          }
+    if (env.BOT_KV && out && out.ok) {
+      await consumeDaily(st, v.fromLike, env);
+      await saveUser(v.userId, st, env);
+    }
 
-          if (env.BOT_KV) {
-            await consumeDaily(st, v.fromLike, env);
-            await saveUser(v.userId, st, env);
-          }
+    const quota = await quotaText(st, v.fromLike, env);
+    return jsonResponse({
+      ok: true,
+      result: out?.text || "",
+      chartUrl: out?.chartUrl || "",
+      headlines: out?.headlines || [],
+      modelJson: out?.plan || null,
+      state: stPublic(st),
+      quota,
+    });
+  } catch (e) {
+    console.error("api/analyze error:", e);
 
-          const quota = await quotaText(st, v.fromLike, env);
-          return jsonResponse({
-            ok: true,
-            result: out?.text || "",
-            chartUrl: out?.chartUrl || "",
-            headlines: out?.headlines || [],
-            modelJson: out?.plan || null,
-            state: stPublic(st),
-            quota,
-          });
-        } catch (e) {
-          console.error("api/analyze error:", e);
+    const msg = String(e?.message || "");
+    let code = "try_again";
+    if (
+      msg.includes("AI_binding_missing") ||
+      msg.includes("OPENAI_API_KEY_missing") ||
+      msg.includes("GEMINI_API_KEY_missing") ||
+      msg.includes("all_text_providers_failed")
+    ) code = "ai_not_configured";
+    else if (
+      msg.includes("market_data") ||
+      msg.includes("binance_") ||
+      msg.includes("yahoo_") ||
+      msg.includes("twelvedata_") ||
+      msg.includes("finnhub_") ||
+      msg.includes("alphavantage_")
+    ) code = "market_data_unavailable";
 
-          const msg = String(e?.message || "");
-          let code = "try_again";
-          if (
-            msg.includes("AI_binding_missing") ||
-            msg.includes("OPENAI_API_KEY_missing") ||
-            msg.includes("GEMINI_API_KEY_missing") ||
-            msg.includes("all_text_providers_failed")
-          ) code = "ai_not_configured";
-          else if (
-            msg.includes("market_data") ||
-            msg.includes("binance_") ||
-            msg.includes("yahoo_") ||
-            msg.includes("twelvedata_") ||
-            msg.includes("finnhub_") ||
-            msg.includes("alphavantage_")
-          ) code = "market_data_unavailable";
-
-          const quota = await quotaText(st, v.fromLike, env).catch(() => "-");
-          const payload = { ok: false, error: code, quota };
-          if (isPrivileged(v.fromLike, env)) payload.debug = e?.message || String(e);
-          return jsonResponse(payload, 500);
-        }
-      }
+    const quota = await quotaText(st, v.fromLike, env).catch(() => "-");
+    const payload = { ok: false, error: code, quota };
+    if (isPrivileged(v.fromLike, env)) payload.debug = e?.message || String(e);
+    return jsonResponse(payload, 500);
+  }
+}
 
 
 
@@ -906,6 +918,11 @@ const BTN = {
   EDUCATION: "📚 آموزش",
   REFERRAL: "🎁 دعوت دوستان",
   BUY: "💳 خرید اشتراک",
+  WALLET: "💰 ولت",
+  WALLET_SET: "🧾 ست ولت (BEP20)",
+  WALLET_DEPOSIT: "➕ درخواست واریز",
+  WALLET_WITHDRAW: "➖ درخواست برداشت",
+  WALLET_BALANCE: "💳 موجودی",
   MINIAPP: "🧩 مینی‌اپ",
   OWNER: "👑 گزارش اونر",
   BACK: "⬅️ برگشت",
@@ -1151,6 +1168,10 @@ function getMiniappUrl(env) {
   if (!raw) return "";
   return raw.replace(/\/+$/, "") + "/";
 }
+function miniappEnabled(env){
+  const v = String((env && (env.ENABLE_MINIAPP || env.MINIAPP_ENABLED)) || "").toLowerCase().trim();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
 function miniappKey(env) {
   const url = getMiniappUrl(env);
   if (!url) return BTN.MINIAPP;
@@ -1158,28 +1179,27 @@ function miniappKey(env) {
 }
 function appendMiniRow(rows, env) {
   rows = rows || [];
+  if(!miniappEnabled(env)) return rows;
   rows.push([miniappKey(env)]);
   return rows;
 }
 
 function requestContactKeyboard(env) {
-  return {
-    keyboard: [
-      [{ text: "📱 ارسال شماره تماس", request_contact: true }],
-      [BTN.BACK, BTN.HOME],
-      [miniappKey(env)],
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: true,
-  };
+  const rows = [
+    [{ text: "📱 ارسال شماره تماس", request_contact: true }],
+    [BTN.BACK, BTN.HOME],
+  ];
+  appendMiniRow(rows, env);
+  return { keyboard: rows, resize_keyboard: true, one_time_keyboard: true };
 }
 
 function mainMenuKeyboard(env) {
   const rows = [
     [BTN.SIGNALS],
     [BTN.SETTINGS, BTN.PROFILE],
-    [BTN.REFERRAL, BTN.BUY],
-    [BTN.EDUCATION, BTN.SUPPORT],
+    [BTN.WALLET, BTN.BUY],
+    [BTN.REFERRAL, BTN.EDUCATION],
+    [BTN.SUPPORT],
   ];
   // owner-only row
   try{
@@ -1216,6 +1236,17 @@ function settingsMenuKeyboard(env) {
   const rows = [
     [BTN.SET_TF, BTN.SET_STYLE],
     [BTN.SET_RISK, BTN.SET_NEWS],
+    [BTN.BACK, BTN.HOME],
+  ];
+  appendMiniRow(rows, env);
+  return kb(rows);
+}
+
+function walletMenuKeyboard(env){
+  const rows = [
+    [BTN.WALLET_SET],
+    [BTN.WALLET_DEPOSIT, BTN.WALLET_WITHDRAW],
+    [BTN.WALLET_BALANCE],
     [BTN.BACK, BTN.HOME],
   ];
   appendMiniRow(rows, env);
@@ -2316,7 +2347,7 @@ async function setVisionPromptTemplate(env, prompt){
 }
 
 /* ========================== TELEGRAM API ========================== */
-async async function tgApi(env, method, payload, isMultipart=false){
+ async function tgApi(env, method, payload, isMultipart=false){
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
   const r = isMultipart
     ? await fetch(url, { method:"POST", body: payload })
@@ -2587,7 +2618,6 @@ function assetKind(symbol){
   if(/^[A-Z]{1,5}$/.test(symbol) || /^[A-Z]{1,5}\.[A-Z]{1,2}$/.test(symbol) || STOCKS.includes(symbol)) return "stock";
   return "unknown";
 }
-}
 function mapTimeframeToBinance(tf){ return ({M15:"15m",H1:"1h",H4:"4h",D1:"1d"})[tf] || "4h"; }
 function mapTimeframeToTwelve(tf){ return ({M15:"15min",H1:"1h",H4:"4h",D1:"1day"})[tf] || "4h"; }
 function mapForexSymbolForTwelve(symbol){
@@ -2621,19 +2651,15 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs, env){
 async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
   if(!symbol.endsWith("USDT")) return null;
   const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
-
   const cacheKey = new Request(url, { method: "GET" });
 
-  if(cache){
-    try{
-      const cached = await cache.match(cacheKey);
-      if(cached){
-        const j = await cached.json().catch(()=>null);
-        if(j) return j;
-      }
-    }catch{}
-  }
+  try{
+    const cached = await caches.default.match(cacheKey);
+    if(cached){
+      const j = await cached.json().catch(()=>null);
+      if(j) return j;
+    }
+  }catch{}
 
   const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
   if(!r.ok) throw new Error(`binance_ticker_http_${r.status}`);
@@ -2648,11 +2674,9 @@ async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
     vol: Number(j.volume),
   };
 
-  if(cache){
-    cache.put(cacheKey, new Response(JSON.stringify(data), {
-      headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${cacheTtlSec}` }
-    })).catch(()=>{});
-  }
+  caches.default.put(cacheKey, new Response(JSON.stringify(data), {
+    headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${cacheTtlSec}` }
+  })).catch(()=>{});
 
   return data;
 }
@@ -2754,7 +2778,7 @@ async function getMarketCandlesWithFallbackMeta(env, symbol, timeframe){
 
   // Layer 1: edge cache (very short)
   const cacheTtlSec = toInt(env.MARKET_CACHE_TTL_SEC, 20);
-  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
+  const cache = (typeof caches !== "undefined") ? caches.default : null;
   const cacheKey = cache
     ? new Request(`https://cache.local/market?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(timeframe)}&limit=${limit}`)
     : null;
@@ -2935,17 +2959,15 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
       `&language=${encodeURIComponent(lang)}` +
       `&category=${encodeURIComponent(cat)}` +
       `&timeframe=${encodeURIComponent(tf)}`;
-    
+
     const cacheKey = new Request(url, { method: "GET" });
-    if(cache){
-      try{
-        const cached = await cache.match(cacheKey);
-        if(cached){
-          const j = await cached.json().catch(()=>null);
-          if(Array.isArray(j)) return j;
-        }
-      }catch{}
-    }
+    try{
+      const cached = await caches.default.match(cacheKey);
+      if(cached){
+        const j = await cached.json().catch(()=>null);
+        if(Array.isArray(j)) return j;
+      }
+    }catch{}
 
     const timeoutMs = toInt(env.NEWS_TIMEOUT_MS, 6000);
     const r = await fetchWithTimeout(url, {}, timeoutMs);
@@ -2961,11 +2983,9 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
     })).filter(x => x.title);
 
     const ttl = toInt(env.NEWS_CACHE_TTL_SEC, 600);
-    if(cache){
-      cache.put(cacheKey, new Response(JSON.stringify(items), {
-        headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${ttl}` }
-      })).catch(()=>{});
-    }
+    caches.default.put(cacheKey, new Response(JSON.stringify(items), {
+      headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${ttl}` }
+    })).catch(()=>{});
 
     return items;
   }catch(e){
@@ -3482,6 +3502,19 @@ async function evaluateLevelByAI(env, st){
 }
 
 /* ========================== UPDATE HANDLER ========================== */
+function renderWalletSummary(st){
+  const addr = (st && st.bep20Address) ? String(st.bep20Address) : "";
+  const bal = Number(st && st.walletBalance || 0);
+  const dep = Number(st && st.walletDepositRequests || 0);
+  const wd = Number(st && st.walletWithdrawRequests || 0);
+  return `🏦 کیف پول
+
+BEP20: ${addr || "-"}
+موجودی: ${bal.toFixed(2)}
+درخواست‌های واریز: ${dep}
+درخواست‌های برداشت: ${wd}`;
+}
+
 async function handleUpdate(update, env){
   try{
     // callback buttons (payments)
@@ -3615,6 +3648,88 @@ async function handleUpdate(update, env){
 }
 
     
+    if(cmd==="/wallet" || text===BTN.WALLET){
+      if(!isOnboardComplete(st)){
+        await tgSendMessage(env, chatId, "برای استفاده از کیف پول، ابتدا پروفایل را تکمیل کن ✅", mainMenuKeyboard(env));
+        await startOnboardingIfNeeded(env, chatId, from, st);
+        return;
+      }
+      st.state="wallet_menu";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, renderWalletSummary(st), walletMenuKeyboard(env));
+    }
+
+    if(text===BTN.WALLET_SET){
+      if(!isOnboardComplete(st)){
+        await tgSendMessage(env, chatId, "برای ست‌کردن ولت، ابتدا پروفایل را تکمیل کن ✅", mainMenuKeyboard(env));
+        await startOnboardingIfNeeded(env, chatId, from, st);
+        return;
+      }
+      st.state="wallet_set_bep20";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "🧾 آدرس ولت BEP20 را ارسال کن (مثال: 0x...):", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if(text===BTN.WALLET_DEPOSIT){
+      if(!isOnboardComplete(st)){
+        await tgSendMessage(env, chatId, "برای درخواست واریز، ابتدا پروفایل را تکمیل کن ✅", mainMenuKeyboard(env));
+        await startOnboardingIfNeeded(env, chatId, from, st);
+        return;
+      }
+      st.walletDepositRequests = (st.walletDepositRequests||0) + 1;
+      st.state="wallet_menu";
+      await saveUser(userId, st, env);
+      try{
+        const targets = managerL1Targets(env);
+        for(const a of targets){
+          await tgSendMessage(env, a, `💰 درخواست واریز
+user=${userId}
+name=${st.profileName||"-"}
+count=${st.walletDepositRequests}`, null).catch(()=>{});
+        }
+      }catch(_e){}
+      return tgSendMessage(env, chatId, "✅ درخواست واریز ثبت شد. پشتیبانی با شما هماهنگ می‌کند.", walletMenuKeyboard(env));
+    }
+
+    if(text===BTN.WALLET_WITHDRAW){
+      if(!isOnboardComplete(st)){
+        await tgSendMessage(env, chatId, "برای درخواست برداشت، ابتدا پروفایل را تکمیل کن ✅", mainMenuKeyboard(env));
+        await startOnboardingIfNeeded(env, chatId, from, st);
+        return;
+      }
+      if(!st.bep20Address){
+        st.state="wallet_set_bep20";
+        await saveUser(userId, st, env);
+        return tgSendMessage(env, chatId, "اول آدرس ولت BEP20 را ست کن (🧾 ست ولت). آدرس را همینجا بفرست:", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.walletWithdrawRequests = (st.walletWithdrawRequests||0) + 1;
+      st.state="wallet_menu";
+      await saveUser(userId, st, env);
+      try{
+        const targets = managerL1Targets(env);
+        for(const a of targets){
+          await tgSendMessage(env, a, `🏦 درخواست برداشت
+user=${userId}
+name=${st.profileName||"-"}
+BEP20=${st.bep20Address}
+count=${st.walletWithdrawRequests}`, null).catch(()=>{});
+        }
+      }catch(_e){}
+      return tgSendMessage(env, chatId, "✅ درخواست برداشت ثبت شد. پس از بررسی، با شما هماهنگ می‌شود.", walletMenuKeyboard(env));
+    }
+
+    if(text===BTN.WALLET_BALANCE){
+      if(!isOnboardComplete(st)){
+        await tgSendMessage(env, chatId, "برای مشاهده موجودی، ابتدا پروفایل را تکمیل کن ✅", mainMenuKeyboard(env));
+        await startOnboardingIfNeeded(env, chatId, from, st);
+        return;
+      }
+      st.state="wallet_menu";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, renderWalletSummary(st), walletMenuKeyboard(env));
+    }
+
+
     if(cmd==="/owner" || text===BTN.OWNER){
       if(!isOwner(from, env)) return tgSendMessage(env, chatId, "⛔️ دسترسی نداری.", mainMenuKeyboard(env));
 
@@ -3816,11 +3931,7 @@ return;
 
     if(cmd==="/support" || text===BTN.SUPPORT){
       return tgSendMessage(env, chatId,
-        "🆘 پشتیبانی
-
-برای ارسال درخواست پشتیبانی، تیکت ثبت کن.
-
-✅ پاسخ از طریق همین بات ارسال می‌شود.",
+        "🆘 پشتیبانی برای ارسال درخواست پشتیبانی، تیکت ثبت کن.✅ پاسخ از طریق همین بات ارسال می‌شود.",
         kb([[BTN.SUPPORT_NEW_TICKET],[BTN.SUPPORT_STATUS],[BTN.BACK,BTN.HOME]])
       );
     }
@@ -3838,10 +3949,7 @@ return;
       const items = res.items || [];
       if(!items.length) return tgSendMessage(env, chatId, "📌 هنوز تیکتی ثبت نکردی.", mainMenuKeyboard(env));
       const lines = items.slice(0,10).map((t,i)=>`${i+1}) ${t.id} | ${t.status} | ${t.createdAt}`);
-      return tgSendMessage(env, chatId, "📌 وضعیت تیکت‌ها:
-
-" + lines.join("
-"), mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, "📌 وضعیت تیکت‌ها:" + lines.join(""), mainMenuKeyboard(env));
     }
 
     if(cmd==="/education" || text===BTN.EDUCATION){
@@ -3858,9 +3966,7 @@ if(cmd==="/customprompt" || cmd==="/prompt"){
   st.state="custom_prompt_style";
   await saveUser(userId, st, env);
   return tgSendMessage(env, chatId,
-    "🧠 درخواست پرامپت اختصاصی
-
-مرحله ۱/۲: سبک معامله‌ات را بنویس (مثلاً: اسمارت‌مانی، RTM، پرایس‌اکشن…):",
+    "🧠 درخواست پرامپت اختصاصی مرحله ۱/۲: سبک معامله‌ات را بنویس (مثلاً: اسمارت‌مانی، RTM، پرایس‌اکشن…):",
     kb([[BTN.BACK, BTN.HOME]])
   );
 }
@@ -3964,6 +4070,21 @@ if(cmd==="/setrefpct"){
       return tgSendMessage(env, chatId, "🏠 منوی اصلی:", mainMenuKeyboard(env));
     }
     if(text===BTN.BACK){
+      if(st.state==="wallet_set_bep20"){
+        st.state="wallet_menu";
+        await saveUser(userId, st, env);
+        return tgSendMessage(env, chatId, renderWalletSummary(st), walletMenuKeyboard(env));
+      }
+      if(st.state==="wallet_menu"){
+        st.state="idle";
+        await saveUser(userId, st, env);
+        return tgSendMessage(env, chatId, "🏠 منوی اصلی:", mainMenuKeyboard(env));
+      }
+      if(st.state && st.state.startsWith("wallet_")){
+        st.state="wallet_menu";
+        await saveUser(userId, st, env);
+        return tgSendMessage(env, chatId, renderWalletSummary(st), walletMenuKeyboard(env));
+      }
       if(st.state==="choose_style"){ st.state="choose_symbol"; st.selectedSymbol=""; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "🧭 مرحله ۱: بازار را انتخاب کن:", signalsMenuKeyboard(env)); }
       if(st.state.startsWith("set_")){ st.state="idle"; await saveUser(userId, st, env); return sendSettingsSummary(env, chatId, st, from); }
       if(st.state.startsWith("onboard_") || st.quiz?.active){ st.state="idle"; st.quiz={active:false, idx:0, answers:[]}; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "متوقف شد. هر زمان خواستی دوباره از 🧪 تعیین سطح استفاده کن.", mainMenuKeyboard(env)); }
@@ -4069,20 +4190,21 @@ ${desc}`;
       );
     }
 
-      st.customPromptDesc = desc;
-      st.customPromptText = String(generated||"").trim();
-      st.customPromptRequestedAt = new Date().toISOString();
-      st.customPromptReadyAt = new Date(Date.now() + CUSTOM_PROMPT_DELAY_MS).toISOString();
-      st.customPromptDeliveredAt = "";
-      st.state="idle";
-      await saveUser(userId, st, env);
 
-      return tgSendMessage(env, chatId, "✅ درخواست ثبت شد. پرامپت اختصاصی شما حدود ۲ ساعت دیگر برایتان ارسال می‌شود.", mainMenuKeyboard(env));
+
+
+    
+
+    if(st.state==="wallet_set_bep20"){
+      const addr = String(text||"").trim();
+      if(addr.length < 10) return tgSendMessage(env, chatId, "آدرس ولت معتبر نیست. دوباره ارسال کن (حداقل ۱۰ کاراکتر) یا ⬅️ برگشت.", kb([[BTN.BACK, BTN.HOME]]));
+      st.bep20Address = addr;
+      st.state="wallet_menu";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✅ آدرس ولت ذخیره شد.", walletMenuKeyboard(env));
     }
 
-
-
-    if(st.state==="support_ticket_text"){
+if(st.state==="support_ticket_text"){
       const msg = String(text||"").trim();
       if(msg === BTN.BACK){ st.state="idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "بازگشت.", mainMenuKeyboard(env)); }
       if(msg.length < 10) return tgSendMessage(env, chatId, "متن تیکت کوتاه است. لطفاً حداقل ۱۰ کاراکتر بنویس:", kb([[BTN.BACK,BTN.HOME]]));
@@ -4184,20 +4306,13 @@ ${st.levelSummary || "—"}
     // Settings menu actions
     if(text===BTN.SET_TF){ st.state="set_tf"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⏱ تایم‌فریم:", optionsKeyboard(["M15","H1","H4","D1"])); }
     if(text===BTN.SET_STYLE){
-      st.state="set_style";
-      await saveUser(userId, st, env);
-      const cat = await getStyleCatalog(env);
-      const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
-      if(!labels.length){
-        return tgSendMessage(
-          env,
-          chatId,
-          "⚠️ هیچ سبک فعالی توسط ادمین تنظیم نشده است.\n\nلطفاً بعداً تلاش کن یا از ادمین بخواه سبک اضافه کند.",
-          mainMenuKeyboard(env)
-        );
-      }
-      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(labels));
-    }
+  st.state="set_style";
+  await saveUser(userId, st, env);
+  const cat = await getStyleCatalog(env);
+  const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
+  if(!labels.length){ return tgSendMessage(env, chatId, "⚠️ هیچ سبک فعالی توسط ادمین تنظیم نشده است. لطفاً بعداً تلاش کن یا از ادمین بخواه سبک اضافه کند.", mainMenuKeyboard(env)); }
+  return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(labels));
+}
     if(text===BTN.SET_RISK){ st.state="set_risk"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⚠️ ریسک:", optionsKeyboard(["کم","متوسط","زیاد"])); }
     if(text===BTN.SET_NEWS){ st.state="set_news"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"])); }
 
@@ -4234,17 +4349,7 @@ if(isSymbol(text)){
   const cat = await getStyleCatalog(env);
   const labels = (cat.items||[]).filter(x=>x && x.enabled!==false).map(x=>String(x.label||"").trim()).filter(Boolean);
 
-  if(!labels.length){
-    st.state="idle";
-    st.selectedSymbol="";
-    await saveUser(userId, st, env);
-    return tgSendMessage(
-      env,
-      chatId,
-      "⚠️ فعلاً هیچ سبک فعالی برای تحلیل وجود ندارد.\nاز ادمین بخواه سبک‌ها را فعال کند.",
-      mainMenuKeyboard(env)
-    );
-  }
+  if(!labels.length){ st.state="idle"; st.selectedSymbol=""; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "⚠️ فعلاً هیچ سبک فعالی برای تحلیل وجود ندارد.\nاز ادمین بخواه سبک‌ها را فعال کند.", mainMenuKeyboard(env)); }
   return tgSendMessage(env, chatId, `🧩 مرحله ۳: سبک تحلیل را انتخاب کن (نماد: ${symbol})`, optionsKeyboard(labels));
 }
 
@@ -5113,7 +5218,7 @@ async function authMiniApp(body, env) {
   // Use ?dev=1 in the Mini App URL; the frontend will send {dev:true,userId:"..."}.
   if (body && body.dev === true && String(env.DEV_MODE || "") === "1") {
     const uid = String(body.userId || "999000").trim() || "999000";
-    return { ok: true, userId: uid, fromLike: { username: "dev", id: uid }, dev: true };
+    return { ok: true, userId: uid, fromLike: { username: "dev" }, dev: true };
   }
   const ttl = Number(env.TELEGRAM_INITDATA_TTL_SEC || 21600);
   return verifyTelegramInitData(body?.initData, env.TELEGRAM_BOT_TOKEN, ttl);
@@ -5259,7 +5364,7 @@ function buildPaymentPageHtml({ brand, wallet, price, currency, days, support })
       }catch(e){ /* ignore */ }
     });
 
-    document.getElementById("submitBtn").addEventListener("click", async ()=>{
+    document.getElementById("submitBtn")?.addEventListener("click", async ()=>{
       const txid = (txInput.value||"").trim();
       if(!txid){
         msg.textContent = "TxID را وارد کن.";
@@ -5295,7 +5400,7 @@ function buildPaymentPageHtml({ brand, wallet, price, currency, days, support })
       }
     });
 
-    document.getElementById("closeBtn").addEventListener("click", ()=> {
+    document.getElementById("closeBtn")?.addEventListener("click", ()=> {
       try{ tg?.close(); }catch(e){ window.close(); }
     });
   </script>
@@ -5304,466 +5409,6 @@ function buildPaymentPageHtml({ brand, wallet, price, currency, days, support })
 }
 
 /* ========================== MINI APP ASSETS (SMALL) ========================== */
-const ADMIN_APP_HTML = `<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>MarketiQ Admin</title>
-  <meta name="color-scheme" content="dark light" />
-  <style>
-    :root{
-      --bg:#0B0F17; --card:rgba(255,255,255,.06); --text:rgba(255,255,255,.92);
-      --muted:rgba(255,255,255,.62); --good:#2FE3A5; --warn:#FFB020; --bad:#FF4D4D;
-      --shadow:0 10px 30px rgba(0,0,0,.35); --radius:18px;
-      --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";
-    }
-    *{box-sizing:border-box}
-    body{margin:0; font-family:var(--font); color:var(--text);
-      background: radial-gradient(900px 500px at 25% -10%, rgba(109,94,246,.35), transparent 60%),
-                 radial-gradient(800px 500px at 90% 0%, rgba(0,209,255,.20), transparent 60%),
-                 linear-gradient(180deg,#070A10 0%, #0B0F17 60%, #090D14 100%);
-      padding:14px 14px calc(14px + env(safe-area-inset-bottom));
-    }
-    .shell{max-width:1000px;margin:0 auto}
-    .top{display:flex;gap:10px;align-items:center;justify-content:space-between;
-      padding:12px;border-radius:20px;border:1px solid rgba(255,255,255,.08);
-      background:rgba(11,15,23,.65);backdrop-filter: blur(10px);box-shadow:var(--shadow);position:sticky;top:0;z-index:10;
-    }
-    .brand{display:flex;gap:10px;align-items:center;min-width:0}
-    .logo{width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg, rgba(109,94,246,1), rgba(0,209,255,1));
-      display:flex;align-items:center;justify-content:center;font-weight:900}
-    .title{font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .muted{color:var(--muted)}
-    .card{margin-top:12px; padding:14px;border-radius:var(--radius);border:1px solid rgba(255,255,255,.08);background:var(--card);box-shadow:var(--shadow)}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .col{flex:1;min-width:220px}
-    label{display:block;font-size:12px;color:var(--muted);margin:4px 0}
-    input,select,textarea{width:100%;padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,.12);
-      background:rgba(0,0,0,.25);color:var(--text);outline:none}
-    textarea{min-height:120px;resize:vertical}
-    button{border:0;border-radius:14px;padding:10px 12px;background:rgba(255,255,255,.10);color:var(--text);cursor:pointer}
-    button.primary{background:linear-gradient(135deg, rgba(109,94,246,1), rgba(0,209,255,1));font-weight:900}
-    button.ok{background:rgba(47,227,165,.18);border:1px solid rgba(47,227,165,.35)}
-    button.danger{background:rgba(255,77,77,.15);border:1px solid rgba(255,77,77,.35)}
-    .hr{height:1px;background:rgba(255,255,255,.08);margin:12px 0}
-    .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.20)}
-    .toast{position:fixed;left:14px;right:14px;bottom:14px;max-width:1000px;margin:0 auto;
-      padding:12px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.55);backdrop-filter: blur(10px);
-      box-shadow:var(--shadow);display:none}
-    .toast.show{display:block}
-    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace}
-    .preview{width:100%;max-height:220px;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,.12)}
-  
-    /* Mobile-friendly */
-    @media (max-width: 720px){
-      body{padding:10px 10px calc(10px + env(safe-area-inset-bottom));}
-      .top{flex-direction:column; align-items:stretch; gap:8px; padding:10px;}
-      .brand{width:100%}
-      .actions{width:100%; display:grid; grid-template-columns: 1fr 1fr; gap:8px;}
-      .actions .btn{width:100%}
-      .grid{grid-template-columns:1fr !important;}
-      .row{grid-template-columns:1fr !important;}
-      .tabs{overflow:auto; -webkit-overflow-scrolling:touch;}
-      table{display:block; overflow:auto; width:100%;}
-      th,td{white-space:nowrap;}
-      .card{padding:12px;}
-      input,select,textarea{font-size:16px;} /* iOS zoom fix */
-    }
-
-</style>
-</head>
-<body>
-  <div class="shell">
-    <div class="top">
-      <div class="brand">
-        <div class="logo">M</div>
-        <div style="min-width:0">
-          <div class="title">MarketiQ Admin</div>
-          <div class="muted" id="status">Offline</div>
-        </div>
-      </div>
-      <div class="pill">
-        <span class="muted">Token</span>
-        <input id="token" class="mono" placeholder="ADMIN_TOKEN" style="width:240px;padding:8px 10px;border-radius:999px" />
-        <button id="saveToken" class="primary">ورود</button>
-      </div>
-    </div>
-
-    <div class="card" id="bootstrapCard">
-      <div class="row">
-        <div class="col">
-          <div class="title" style="font-size:14px">تنظیمات اشتراک و محدودیت‌ها</div>
-          <div class="muted">داده‌ها در D1 ذخیره می‌شوند و KV فقط کش/فالبک است.</div>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="row">
-        <div class="col"><label>قیمت</label><input id="price" /></div>
-        <div class="col"><label>واحد</label><input id="currency" /></div>
-        <div class="col"><label>روز</label><input id="days" /></div>
-      </div>
-
-      <div class="row" style="margin-top:10px">
-        <div class="col"><label>سقف روزانه رایگان</label><input id="freeLimit" /></div>
-        <div class="col"><label>سقف روزانه اشتراک</label><input id="subLimit" /></div>
-        <div class="col"><label>سقف ماهانه</label><input id="monthlyLimit" /></div>
-      </div>
-
-      <div style="margin-top:10px">
-        <button id="saveCfg" class="ok">ذخیره</button>
-        <span class="muted" id="cfgMsg" style="margin-right:10px"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="title" style="font-size:14px">🧠 مدیریت سبک‌ها (CRUD کامل)</div>
-      <div class="muted">هر سبک: key + label + prompt. Mini App از همین لیست ساخته می‌شود.</div>
-
-      <div class="hr"></div>
-
-      <div class="row">
-        <div class="col">
-          <label>انتخاب سبک</label>
-          <select id="stylePick"></select>
-        </div>
-        <div class="col">
-          <label>کلید (key)</label>
-          <input id="styleKey" class="mono" placeholder="مثلاً ict" />
-        </div>
-        <div class="col">
-          <label>نام نمایشی (label)</label>
-          <input id="styleLabel" placeholder="مثلاً ICT" />
-        </div>
-        <div class="col">
-          <label>مرتب‌سازی (sort)</label>
-          <input id="styleSort" placeholder="مثلاً 10" />
-        </div>
-        <div class="col">
-          <label>وضعیت</label>
-          <select id="styleEnabled"><option value="1">فعال</option><option value="0">غیرفعال</option></select>
-        </div>
-      </div>
-
-      <div style="margin-top:10px">
-        <label>Prompt</label>
-        <textarea id="stylePrompt" placeholder="پرامپت این سبک"></textarea>
-      </div>
-
-      <div style="margin-top:10px">
-        <button id="styleSave" class="primary">ذخیره/ایجاد</button>
-        <button id="styleDelete" class="danger">حذف</button>
-        <span class="muted" id="styleMsg" style="margin-right:10px"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="title" style="font-size:14px">🖼️ بنر داخل اپ (R2)</div>
-      <div class="muted">آپلود با URL → ذخیره در R2 → انتخاب بنر فعال</div>
-
-      <div class="hr"></div>
-
-      <div class="row">
-        <div class="col"><label>URL تصویر</label><input id="bannerUrl" placeholder="https://.../banner.jpg" /></div>
-        <div class="col"><label>کلید (اختیاری)</label><input id="bannerKey" class="mono" placeholder="مثلاً offer_1" /></div>
-        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="bannerUpload" class="primary">آپلود به R2</button></div>
-      </div>
-
-      <div style="margin-top:10px" class="row">
-        <div class="col">
-          <label>بنرهای موجود</label>
-          <select id="bannerPick"></select>
-        </div>
-        <div class="col" style="min-width:180px">
-          <label>&nbsp;</label>
-          <button id="bannerActivate" class="ok">فعال کن</button>
-        </div>
-      </div>
-
-      <div style="margin-top:10px">
-        <img id="bannerPreview" class="preview" alt="preview" />
-        <div class="muted" style="margin-top:8px">آدرس سرو: <span id="bannerServe" class="mono"></span></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="title" style="font-size:14px">💸 کمیسیون رفرال (بر اساس code یا username)</div>
-      <div class="muted">برای بعضی لینک‌ها درصد متفاوت می‌گذاریم. اولویت: override روی code → override روی user → نرخ پیش‌فرض.</div>
-
-      <div class="hr"></div>
-
-      <div class="row">
-        <div class="col"><label>Referral Code (start=...)</label><input id="commCode" class="mono" placeholder="mqxxxx" /></div>
-        <div class="col"><label>یا Username</label><input id="commUser" class="mono" placeholder="@username یا username" /></div>
-        <div class="col"><label>درصد (0..100) / خالی = حذف</label><input id="commPct" placeholder="مثلاً 12.5" /></div>
-        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="commSave" class="primary">ذخیره</button></div>
-      </div>
-      <div class="muted" id="commMsg" style="margin-top:8px"></div>
-    </div>
-  </div>
-
-  <div id="toast" class="toast"></div>
-  <script src="/admin.js"></script>
-</body>
-</html>`;
-const ADMIN_APP_JS = `const $ = (id)=>document.getElementById(id);
-const toastEl = $("toast");
-
-function toast(msg){
-  toastEl.textContent = msg;
-  toastEl.classList.add("show");
-  setTimeout(()=>toastEl.classList.remove("show"), 2600);
-}
-
-function getToken(){
-  return (localStorage.getItem("admin_token") || $("token").value || "").trim();
-}
-function setToken(t){
-  localStorage.setItem("admin_token", t);
-  $("token").value = t;
-}
-
-async function api(path, payload, method="POST"){
-  const token = getToken();
-  const r = await fetch(path, {
-    method,
-    headers: {
-      "content-type":"application/json",
-      "x-admin-token": token,
-    },
-    body: method === "GET" ? undefined : JSON.stringify(payload || {}),
-  });
-  const j = await r.json().catch(()=>null);
-  return { ok: r.ok, status: r.status, j };
-}
-
-function setStatus(txt, ok){
-  $("status").textContent = txt;
-  $("status").style.color = ok ? "var(--good)" : "var(--muted)";
-}
-
-function normKey(s){
-  return String(s||"").trim().toLowerCase().replace(/[^a-z0-9_]/g,"");
-}
-
-let styles = [];
-let banners = [];
-
-function fillStyles(){
-  const sel = $("stylePick");
-  sel.innerHTML = "";
-  const opt0 = document.createElement("option");
-  opt0.value = "";
-  opt0.textContent = "— جدید —";
-  sel.appendChild(opt0);
-
-  styles.forEach(st=>{
-    const o = document.createElement("option");
-    o.value = st.key;
-    o.textContent = st.label + " (" + st.key + ")" + (st.enabled ? "" : " [OFF]");
-    sel.appendChild(o);
-  });
-}
-
-function pickStyle(key){
-  const s = styles.find(x=>x.key===key);
-  if(!s){
-    $("styleKey").value = "";
-    $("styleLabel").value = "";
-    $("styleSort").value = "10";
-    $("styleEnabled").value = "1";
-    $("stylePrompt").value = "";
-    return;
-  }
-  $("styleKey").value = s.key;
-  $("styleLabel").value = s.label;
-  $("styleSort").value = String(s.sort ?? 10);
-  $("styleEnabled").value = s.enabled ? "1" : "0";
-  $("stylePrompt").value = s.prompt || "";
-}
-
-function fillBanners(){
-  const sel = $("bannerPick");
-  sel.innerHTML = "";
-  banners.forEach(b=>{
-    const o = document.createElement("option");
-    o.value = b.key;
-    o.textContent = b.key + (b.active ? " (ACTIVE)" : "");
-    sel.appendChild(o);
-  });
-  if(banners.length){
-    sel.value = banners.find(b=>b.active)?.key || banners[0].key;
-    updateBannerPreview();
-  }
-}
-
-function updateBannerPreview(){
-  const key = $("bannerPick").value;
-  const b = banners.find(x=>x.key===key);
-  const url = b?.serveUrl || "";
-  $("bannerPreview").src = url || "";
-  $("bannerServe").textContent = url || "—";
-}
-
-async function bootstrap(){
-  const token = getToken();
-  if(!token){
-    setStatus("Token لازم است", false);
-    return;
-  }
-  setStatus("در حال اتصال…", false);
-  const r = await api("/api/admin2/bootstrap", {});
-  if(!r.j?.ok){
-    setStatus("ورود ناموفق", false);
-    toast(r.j?.error || "auth_failed");
-    return;
-  }
-  setStatus("Online", true);
-
-  const c = r.j.config || {};
-  $("price").value = c.price ?? "";
-  $("currency").value = c.currency ?? "";
-  $("days").value = c.days ?? "";
-  $("freeLimit").value = c.freeLimit ?? "";
-  $("subLimit").value = c.subLimit ?? "";
-  $("monthlyLimit").value = c.monthlyLimit ?? "";
-
-  styles = Array.isArray(r.j.styles) ? r.j.styles : [];
-  banners = Array.isArray(r.j.banners) ? r.j.banners : [];
-
-  fillStyles();
-  fillBanners();
-  pickStyle($("stylePick").value);
-
-  toast("✅ وارد شدی");
-}
-
-$("saveToken").addEventListener("click", ()=>{
-  const t = $("token").value.trim();
-  if(!t){ toast("توکن را وارد کن"); return; }
-  setToken(t);
-  bootstrap();
-});
-
-$("stylePick").addEventListener("change", ()=> pickStyle($("stylePick").value));
-
-$("styleSave").addEventListener("click", async ()=>{
-  const key = normKey($("styleKey").value);
-  const label = String($("styleLabel").value||"").trim();
-  const prompt = String($("stylePrompt").value||"");
-  const sort = Number($("styleSort").value||"10");
-  const enabled = $("styleEnabled").value === "1";
-  if(!key || !label){
-    toast("key و label لازم است");
-    return;
-  }
-  $("styleMsg").textContent = "در حال ذخیره…";
-  const r = await api("/api/admin2/style/upsert", { key, label, prompt, sort, enabled });
-  if(r.j?.ok){
-    $("styleMsg").textContent = "✅ ذخیره شد";
-    await bootstrap();
-  }else{
-    $("styleMsg").textContent = "❌ خطا";
-    toast(r.j?.error || "try_again");
-  }
-});
-
-$("styleDelete").addEventListener("click", async ()=>{
-  const key = normKey($("styleKey").value);
-  if(!key){ toast("key لازم است"); return; }
-  if(!confirm("حذف شود؟")) return;
-  $("styleMsg").textContent = "در حال حذف…";
-  const r = await api("/api/admin2/style/delete", { key });
-  if(r.j?.ok){
-    $("styleMsg").textContent = "✅ حذف شد";
-    await bootstrap();
-  }else{
-    $("styleMsg").textContent = "❌ خطا";
-    toast(r.j?.error || "try_again");
-  }
-});
-
-$("saveCfg").addEventListener("click", async ()=>{
-  $("cfgMsg").textContent = "در حال ذخیره…";
-  const payload = {
-    price: $("price").value,
-    currency: $("currency").value,
-    days: $("days").value,
-    freeLimit: $("freeLimit").value,
-    subLimit: $("subLimit").value,
-    monthlyLimit: $("monthlyLimit").value,
-  };
-  const r = await api("/api/admin2/config/set", payload);
-  if(r.j?.ok){
-    $("cfgMsg").textContent = "✅ ذخیره شد";
-    toast("ذخیره شد");
-  }else{
-    $("cfgMsg").textContent = "❌ خطا";
-    toast(r.j?.error || "try_again");
-  }
-});
-
-$("bannerPick").addEventListener("change", updateBannerPreview);
-
-$("bannerUpload").addEventListener("click", async ()=>{
-  const url = String($("bannerUrl").value||"").trim();
-  const key = normKey($("bannerKey").value) || "";
-  if(!url){ toast("URL لازم است"); return; }
-  const r = await api("/api/admin2/banner/upload", { url, key });
-  if(r.j?.ok){
-    toast("آپلود شد");
-    $("bannerUrl").value = "";
-    $("bannerKey").value = "";
-    await bootstrap();
-  }else{
-    toast(r.j?.error || "upload_failed");
-  }
-});
-
-$("bannerActivate").addEventListener("click", async ()=>{
-  const key = $("bannerPick").value;
-  if(!key){ toast("بنری انتخاب نشده"); return; }
-  const r = await api("/api/admin2/banner/activate", { key });
-  if(r.j?.ok){
-    toast("فعال شد");
-    await bootstrap();
-  }else{
-    toast(r.j?.error || "try_again");
-  }
-});
-
-$("commSave").addEventListener("click", async ()=>{
-  const code = String($("commCode").value||"").trim();
-  const username = String($("commUser").value||"").trim().replace(/^@/,"");
-  const pctRaw = String($("commPct").value||"").trim();
-  const pct = pctRaw === "" ? null : Number(pctRaw);
-  if(!code && !username){
-    toast("کد یا یوزرنیم لازم است");
-    return;
-  }
-  if(pct !== null && (!Number.isFinite(pct) || pct < 0 || pct > 100)){
-    toast("درصد نامعتبر است");
-    return;
-  }
-  $("commMsg").textContent = "در حال ذخیره…";
-  const r = await api("/api/admin2/commission/set", { code: code || null, username: username || null, pct });
-  if(r.j?.ok){
-    $("commMsg").textContent = "✅ ذخیره شد";
-    toast("ذخیره شد");
-  }else{
-    $("commMsg").textContent = "❌ خطا";
-    toast(r.j?.error || "try_again");
-  }
-});
-
-(function init(){
-  const t = localStorage.getItem("admin_token") || "";
-  if(t) $("token").value = t;
-  bootstrap();
-})();`;
-
 
 /* ========================== SIMPLE MINI APP (NEW UI) ========================== */
 const MINI_APP_HTML = [
@@ -6075,15 +5720,6 @@ const MINI_APP_HTML = [
   '        </div>',
   '',
   '        <div class="out" id="out">آماده…</div>',
-  '        <div class="card" id="chartCard" style="margin-top:12px">',
-  '          <div class="card-h"><strong>چارت و زون‌ها</strong><span class="muted" id="chartMeta">—</span></div>',
-  '          <div class="card-b">',
-  '            <img id="chartImg" alt="chart" style="width:100%; border-radius:16px; display:none" />',
-  '            <div style="height:10px"></div>',
-  '            <textarea id="jsonOut" class="control" style="min-height:140px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; direction:ltr; display:none" readonly></textarea>',
-  '          </div>',
-  '        </div>',
-  '',
   '      </div>',
   '    </div>',
   '',
@@ -6138,205 +5774,204 @@ const MINI_APP_HTML = [
   '  <script src="https://telegram.org/js/telegram-web-app.js"></script>',
   '  <script src="/app.js"></script>',
   '</body>',
-  '</html>'
+  '</html>',
 ].join('\n');
 
-const MINI_APP_JS = [
-  'const tg = window.Telegram?.WebApp;',
-  'if (tg) tg.ready();',
-  '',
-  'const out = document.getElementById("out");',
-  'const meta = document.getElementById("meta");',
-  'const sub = document.getElementById("sub");',
-  'const pillTxt = document.getElementById("pillTxt");',
-  'const welcome = document.getElementById("welcome");',
-  '',
-  'function el(id){ return document.getElementById(id); }',
-  'function val(id){ return el(id).value; }',
-  'function setVal(id, v){ el(id).value = v; }',
-  '',
-  'const toast = el("toast");',
-  'const toastT = el("toastT");',
-  'const toastS = el("toastS");',
-  'const toastB = el("toastB");',
-  'const spin = el("spin");',
-  '',
-  'let ALL_SYMBOLS = [];',
-  '',
-  'function showToast(title, subline = "", badge = "", loading = false){',
-  '  toastT.textContent = title || "";',
-  '  toastS.textContent = subline || "";',
-  '  toastB.textContent = badge || "";',
-  '  spin.style.display = loading ? "inline-block" : "none";',
-  '  toast.classList.add("show");',
-  '}',
-  'function hideToast(){ toast.classList.remove("show"); }',
-  '',
-  'function fillSymbols(list){',
-  '  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];',
-  '  const sel = el("symbol");',
-  '  const cur = sel.value;',
-  '  sel.innerHTML = "";',
-  '  for (const s of ALL_SYMBOLS) {',
-  '    const opt = document.createElement("option");',
-  '    opt.value = s;',
-  '    opt.textContent = s;',
-  '    sel.appendChild(opt);',
-  '  }',
-  '  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;',
-  '}',
-  '',
-  'function fillStyles(list, selectedKeyOrLabel){',
-  '  const sel = el("style");',
-  '  if(!sel) return;',
-  '  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];',
-  '  if(!items.length) return;',
-  '',
-  '  const cur = sel.value;',
-  '  sel.innerHTML = "";',
-  '  for(const it of items){',
-  '    const o = document.createElement("option");',
-  '    o.value = it.key;',
-  '    o.textContent = it.label;',
-  '    sel.appendChild(o);',
-  '  }',
-  '',
-  '  // Prefer server-provided styleKey, otherwise keep current, otherwise try match by label',
-  '  const prefer = (selectedKeyOrLabel || "").toString().trim();',
-  '  if(prefer && items.some(x=>x.key===prefer)) sel.value = prefer;',
-  '  else if(cur && items.some(x=>x.key===cur)) sel.value = cur;',
-  '  else {',
-  '    const byLabel = items.find(x=>x.label===prefer);',
-  '    if(byLabel) sel.value = byLabel.key;',
-  '  }',
-  '}',
-  '',
-  'function renderStyleCards(list, selectedKey){',
-  '  const wrap = el("styleCards");',
-  '  const sel = el("style");',
-  '  if(!wrap || !sel) return;',
-  '',
-  '  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];',
-  '  wrap.innerHTML = "";',
-  '  if(!items.length) return;',
-  '',
-  '  const cur = (selectedKey || sel.value || "").toString();',
-  '  for(const it of items){',
-  '    const card = document.createElement("div");',
-  '    card.className = "sCard" + (it.key === cur ? " on" : "");',
-  '    card.dataset.key = it.key;',
-  '',
-  '    const ic = document.createElement("div");',
-  '    ic.className = "sIcon";',
-  '    const ch = (it.label || it.key || "?").toString().trim().charAt(0) || "?";',
-  '    ic.textContent = ch;',
-  '',
-  '    const meta = document.createElement("div");',
-  '    meta.className = "sMeta";',
-  '',
-  '    const nm = document.createElement("div");',
-  '    nm.className = "sName";',
-  '    nm.textContent = it.label;',
-  '',
-  '    const ky = document.createElement("div");',
-  '    ky.className = "sKey";',
-  '    ky.textContent = it.key;',
-  '',
-  '    meta.appendChild(nm);',
-  '    meta.appendChild(ky);',
-  '',
-  '    card.appendChild(ic);',
-  '    card.appendChild(meta);',
-  '',
-  '    card.addEventListener("click", () => {',
-  '      sel.value = it.key;',
-  '      const all = wrap.querySelectorAll(".sCard");',
-  '      for(const n of all) n.classList.remove("on");',
-  '      card.classList.add("on");',
-  '    });',
-  '',
-  '    wrap.appendChild(card);',
-  '  }',
-  '}',
-  '',
-  'function renderBanner(url){',
-  '  const wrap = el("bannerWrap");',
-  '  const img = el("bannerImg");',
-  '  if(!wrap || !img) return;',
-  '  if(url){',
-  '    img.src = url;',
-  '    wrap.style.display = "block";',
-  '  }else{',
-  '    wrap.style.display = "none";',
-  '  }',
-  '}',
-  '',
-  'function filterSymbols(q){',
-  '  q = (q || "").trim().toUpperCase();',
-  '  const sel = el("symbol");',
-  '  const cur = sel.value;',
-  '  sel.innerHTML = "";',
-  '',
-  '  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));',
-  '  for (const s of list) {',
-  '    const opt = document.createElement("option");',
-  '    opt.value = s;',
-  '    opt.textContent = s;',
-  '    sel.appendChild(opt);',
-  '  }',
-  '  if (cur && list.includes(cur)) sel.value = cur;',
-  '}',
-  '',
-  'function setTf(tf){',
-  '  setVal("timeframe", tf);',
-  '  const chips = el("tfChips")?.querySelectorAll(".chip") || [];',
-  '  for (const c of chips) c.classList.toggle("on", c.dataset.tf === tf);',
-  '}',
-  '',
-  'async function api(path, body){',
-  '  const r = await fetch(path, {',
-  '    method: "POST",',
-  '    headers: {"content-type":"application/json"},',
-  '    body: JSON.stringify(body),',
-  '  });',
-  '  const j = await r.json().catch(() => null);',
-  '  return { status: r.status, json: j };',
-  '}',
-  '',
-  'function prettyErr(j, status){',
-  '  const e = j?.error || "نامشخص";',
-  '  if (String(e) === "auth_failed") return "این مینی‌اپ فقط داخل تلگرام کار می‌کند.";',
-  '  if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";',
-  '  if (status === 403 && (String(e) === "onboarding_required" || String(e) === "onboarding_needed")) return "ابتدا نام و شماره را داخل ربات ثبت کنید.";',
-  '  if (status === 401) return "احراز هویت تلگرام ناموفق است. لطفاً مینی‌اپ را داخل تلگرام باز کنید.";',
-  '  return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";',
-  '}',
-  '',
-  'function updateMeta(state, quota){',
-  '  meta.textContent = "سهمیه: " + (quota || "-");',
-  '  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Kyiv): " + (state?.dailyDate || "-");',
-  '}',
-  '',
-  'function updateEnergy(energy){',
-  '  const bar = el("energyBar");',
-  '  const txt = el("energyTxt");',
-  '  const subl = el("energySub");',
-  '  if(!energy || !bar || !txt || !subl) return;',
-  '',
-  '  const d = energy.daily || {};',
-  '  const m = energy.monthly || {};',
-  '  const dLim = Number.isFinite(d.limit) ? d.limit : null;',
-  '  const mLim = Number.isFinite(m.limit) ? m.limit : null;',
-  '',
-  '  // show primary as daily, fallback to monthly',
-  '  const used = Number(d.used||0);',
-  '  const lim = dLim || mLim || 1;',
-  '  const pct = Math.max(0, Math.min(100, Math.round((used/lim)*100)));',
-  '  bar.style.width = pct + "%";',
-  '',
-  '  txt.textContent = \\`روز: \\${d.used||0}/\\${dLim ?? "∞"} | ماه: \\${m.used||0}/\\${mLim ?? "∞"}\\'
-].join('\n');
-  subl.textContent = \`باقی‌مانده روز: \${d.remaining ?? "∞"} | باقی‌مانده ماه: \${m.remaining ?? "∞"}\`;
+const MINI_APP_JS = `const DEV = false;
+const tg = window.Telegram?.WebApp;
+if (tg) tg.ready();
+
+const out = document.getElementById("out");
+const meta = document.getElementById("meta");
+const sub = document.getElementById("sub");
+const pillTxt = document.getElementById("pillTxt");
+const welcome = document.getElementById("welcome");
+
+function el(id){ return document.getElementById(id); }
+function val(id){ return el(id).value; }
+function setVal(id, v){ el(id).value = v; }
+
+const toast = el("toast");
+const toastT = el("toastT");
+const toastS = el("toastS");
+const toastB = el("toastB");
+const spin = el("spin");
+
+let ALL_SYMBOLS = [];
+
+function showToast(title, subline = "", badge = "", loading = false){
+  toastT.textContent = title || "";
+  toastS.textContent = subline || "";
+  toastB.textContent = badge || "";
+  spin.style.display = loading ? "inline-block" : "none";
+  toast.classList.add("show");
+}
+function hideToast(){ toast.classList.remove("show"); }
+
+function fillSymbols(list){
+  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of ALL_SYMBOLS) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;
+}
+
+function fillStyles(list, selectedKeyOrLabel){
+  const sel = el("style");
+  if(!sel) return;
+  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];
+  if(!items.length) return;
+
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for(const it of items){
+    const o = document.createElement("option");
+    o.value = it.key;
+    o.textContent = it.label;
+    sel.appendChild(o);
+  }
+
+  // Prefer server-provided styleKey, otherwise keep current, otherwise try match by label
+  const prefer = (selectedKeyOrLabel || "").toString().trim();
+  if(prefer && items.some(x=>x.key===prefer)) sel.value = prefer;
+  else if(cur && items.some(x=>x.key===cur)) sel.value = cur;
+  else {
+    const byLabel = items.find(x=>x.label===prefer);
+    if(byLabel) sel.value = byLabel.key;
+  }
+}
+
+function renderStyleCards(list, selectedKey){
+  const wrap = el("styleCards");
+  const sel = el("style");
+  if(!wrap || !sel) return;
+
+  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];
+  wrap.innerHTML = "";
+  if(!items.length) return;
+
+  const cur = (selectedKey || sel.value || "").toString();
+  for(const it of items){
+    const card = document.createElement("div");
+    card.className = "sCard" + (it.key === cur ? " on" : "");
+    card.dataset.key = it.key;
+
+    const ic = document.createElement("div");
+    ic.className = "sIcon";
+    const ch = (it.label || it.key || "?").toString().trim().charAt(0) || "?";
+    ic.textContent = ch;
+
+    const meta = document.createElement("div");
+    meta.className = "sMeta";
+
+    const nm = document.createElement("div");
+    nm.className = "sName";
+    nm.textContent = it.label;
+
+    const ky = document.createElement("div");
+    ky.className = "sKey";
+    ky.textContent = it.key;
+
+    meta.appendChild(nm);
+    meta.appendChild(ky);
+
+    card.appendChild(ic);
+    card.appendChild(meta);
+
+    card.addEventListener("click", () => {
+      sel.value = it.key;
+      const all = wrap.querySelectorAll(".sCard");
+      for(const n of all) n.classList.remove("on");
+      card.classList.add("on");
+    });
+
+    wrap.appendChild(card);
+  }
+}
+
+function renderBanner(url){
+  const wrap = el("bannerWrap");
+  const img = el("bannerImg");
+  if(!wrap || !img) return;
+  if(url){
+    img.src = url;
+    wrap.style.display = "block";
+  }else{
+    wrap.style.display = "none";
+  }
+}
+
+function filterSymbols(q){
+  q = (q || "").trim().toUpperCase();
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
+
+  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));
+  for (const s of list) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && list.includes(cur)) sel.value = cur;
+}
+
+function setTf(tf){
+  setVal("timeframe", tf);
+  const chips = el("tfChips")?.querySelectorAll(".chip") || [];
+  for (const c of chips) c.classList.toggle("on", c.dataset.tf === tf);
+}
+
+async function api(path, body){
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"content-type":"application/json"},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => null);
+  return { status: r.status, json: j };
+}
+
+function prettyErr(j, status){
+  const e = j?.error || "نامشخص";
+  if (String(e) === "auth_failed") return "این مینی‌اپ فقط داخل تلگرام کار می‌کند.";
+  if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
+  if (status === 403 && (String(e) === "onboarding_required" || String(e) === "onboarding_needed")) return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
+  if (status === 401) return "احراز هویت تلگرام ناموفق است. لطفاً مینی‌اپ را داخل تلگرام باز کنید.";
+  return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
+}
+
+function updateMeta(state, quota){
+  meta.textContent = "سهمیه: " + (quota || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Kyiv): " + (state?.dailyDate || "-");
+}
+
+function updateEnergy(energy){
+  const bar = el("energyBar");
+  const txt = el("energyTxt");
+  const subl = el("energySub");
+  if(!energy || !bar || !txt || !subl) return;
+
+  const d = energy.daily || {};
+  const m = energy.monthly || {};
+  const dLim = Number.isFinite(d.limit) ? d.limit : null;
+  const mLim = Number.isFinite(m.limit) ? m.limit : null;
+
+  // show primary as daily, fallback to monthly
+  const used = Number(d.used||0);
+  const lim = dLim || mLim || 1;
+  const pct = Math.max(0, Math.min(100, Math.round((used/lim)*100)));
+  bar.style.width = pct + "%";
+
+  txt.textContent = "روز: " + (d.used||0) + "/" + (dLim ?? "∞") + " | ماه: " + (m.used||0) + "/" + (mLim ?? "∞");
+  subl.textContent = "باقی‌مانده روز: " + ((d.remaining==null)?"∞":d.remaining) + " | باقی‌مانده ماه: " + ((m.remaining==null)?"∞":m.remaining);
 }
 
 function renderOffer(offer){
@@ -6385,14 +6020,6 @@ function renderProfile(profile){
 }
 
 async function boot(){
-  // If opened outside Telegram, don't hang on "connecting"
-  if(!tg || !tg.initData){
-    el("conn").textContent = "برای استفاده، مینی‌اپ را داخل تلگرام باز کنید.";
-    el("connDot").className = "dot off";
-    // still allow basic UI (no API calls)
-    return;
-  }
-
   out.textContent = "⏳ در حال آماده‌سازی…";
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
@@ -6421,34 +6048,6 @@ async function boot(){
   fillSymbols(json.symbols || []);
   fillStyles(json.styles || [], (json.styleKey || (json.state && json.state.style) || ""));
   renderStyleCards(json.styles || [], el("style").value);
-
-  // live refresh catalogs when admin changes (version bump)
-  try{
-    window.__stylesVer = String(json.stylesVersion || "0");
-    window.__bannersVer = String(json.bannersVersion || "0");
-    if(!window.__catalogPoll){
-      window.__catalogPoll = setInterval(async ()=>{
-        try{
-          const u = await api("/api/user", { initData: STATE.initData });
-          if(!u || !u.ok) return;
-
-          const nv = String(u.stylesVersion || "0");
-          if(nv && nv !== window.__stylesVer){
-            window.__stylesVer = nv;
-            fillStyles(u.styles || []);
-            renderStyleCards(u.styles || [], el("style").value);
-          }
-
-          const bv = String(u.bannersVersion || "0");
-          if(bv && bv !== window.__bannersVer){
-            window.__bannersVer = bv;
-            renderBanner(u.bannerUrl || "");
-          }
-        }catch(_e){}
-      }, 45000);
-    }
-  }catch(_e){}
-
   renderBanner(json.bannerUrl || "");
   renderOffer(json.offer);
   updateEnergy(json.energy);
@@ -6522,21 +6121,6 @@ el("analyze").addEventListener("click", async () => {
   }
 
   out.textContent = json.result || "⚠️ بدون خروجی";
-  // Render chart image (QuickChart) + structured JSON (zones/levels)
-  try{
-    const img = el("chartImg");
-    const meta = el("chartMeta");
-    const jbox = el("jsonOut");
-    if(meta) meta.textContent = (val("symbol") || "").toUpperCase();
-    if(img){
-      if(json.chartUrl){ img.src = json.chartUrl; img.style.display = "block"; }
-      else { img.style.display = "none"; }
-    }
-    if(jbox){
-      if(json.modelJson){ jbox.value = JSON.stringify(json.modelJson, null, 2); jbox.style.display = "block"; }
-      else { jbox.style.display = "none"; }
-    }
-  }catch(_e){}
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
@@ -6606,7 +6190,928 @@ el("cpReq")?.addEventListener("click", async ()=>{
   setTimeout(hideToast, 1400);
 });
 
+boot();;
+
+const ADMIN_APP_HTML = [
+  '<!doctype html>',
+  '<html lang="fa" dir="rtl">',
+  '<head>',
+  '  <meta charset="utf-8" />',
+  '  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />',
+  '  <title>MarketiQ Admin</title>',
+  '  <meta name="color-scheme" content="dark light" />',
+  '  <style>',
+  '    :root{',
+  '      --bg:#0B0F17; --card:rgba(255,255,255,.06); --text:rgba(255,255,255,.92);',
+  '      --muted:rgba(255,255,255,.62); --good:#2FE3A5; --warn:#FFB020; --bad:#FF4D4D;',
+  '      --shadow:0 10px 30px rgba(0,0,0,.35); --radius:18px;',
+  '      --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";',
+  '    }',
+  '    *{box-sizing:border-box}',
+  '    body{margin:0; font-family:var(--font); color:var(--text);',
+  '      background: radial-gradient(900px 500px at 25% -10%, rgba(109,94,246,.35), transparent 60%),',
+  '                 radial-gradient(800px 500px at 90% 0%, rgba(0,209,255,.20), transparent 60%),',
+  '                 linear-gradient(180deg,#070A10 0%, #0B0F17 60%, #090D14 100%);',
+  '      padding:14px 14px calc(14px + env(safe-area-inset-bottom));',
+  '    }',
+  '    .shell{max-width:1000px;margin:0 auto}',
+  '    .top{display:flex;gap:10px;align-items:center;justify-content:space-between;',
+  '      padding:12px;border-radius:20px;border:1px solid rgba(255,255,255,.08);',
+  '      background:rgba(11,15,23,.65);backdrop-filter: blur(10px);box-shadow:var(--shadow);position:sticky;top:0;z-index:10;',
+  '    }',
+  '    .brand{display:flex;gap:10px;align-items:center;min-width:0}',
+  '    .logo{width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg, rgba(109,94,246,1), rgba(0,209,255,1));',
+  '      display:flex;align-items:center;justify-content:center;font-weight:900}',
+  '    .title{font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+  '    .muted{color:var(--muted)}',
+  '    .card{margin-top:12px; padding:14px;border-radius:var(--radius);border:1px solid rgba(255,255,255,.08);background:var(--card);box-shadow:var(--shadow)}',
+  '    .row{display:flex;gap:10px;flex-wrap:wrap}',
+  '    .col{flex:1;min-width:220px}',
+  '    label{display:block;font-size:12px;color:var(--muted);margin:4px 0}',
+  '    input,select,textarea{width:100%;padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,.12);',
+  '      background:rgba(0,0,0,.25);color:var(--text);outline:none}',
+  '    textarea{min-height:120px;resize:vertical}',
+  '    button{border:0;border-radius:14px;padding:10px 12px;background:rgba(255,255,255,.10);color:var(--text);cursor:pointer}',
+  '    button.primary{background:linear-gradient(135deg, rgba(109,94,246,1), rgba(0,209,255,1));font-weight:900}',
+  '    button.ok{background:rgba(47,227,165,.18);border:1px solid rgba(47,227,165,.35)}',
+  '    button.danger{background:rgba(255,77,77,.15);border:1px solid rgba(255,77,77,.35)}',
+  '    .hr{height:1px;background:rgba(255,255,255,.08);margin:12px 0}',
+  '    .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.20)}',
+  '    .toast{position:fixed;left:14px;right:14px;bottom:14px;max-width:1000px;margin:0 auto;',
+  '      padding:12px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.55);backdrop-filter: blur(10px);',
+  '      box-shadow:var(--shadow);display:none}',
+  '    .toast.show{display:block}',
+  '    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace}',
+  '    .preview{width:100%;max-height:220px;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,.12)}',
+  '  ',
+  '    /* Mobile-friendly */',
+  '    @media (max-width: 720px){',
+  '      body{padding:10px 10px calc(10px + env(safe-area-inset-bottom));}',
+  '      .top{flex-direction:column; align-items:stretch; gap:8px; padding:10px;}',
+  '      .brand{width:100%}',
+  '      .actions{width:100%; display:grid; grid-template-columns: 1fr 1fr; gap:8px;}',
+  '      .actions .btn{width:100%}',
+  '      .grid{grid-template-columns:1fr !important;}',
+  '      .row{grid-template-columns:1fr !important;}',
+  '      .tabs{overflow:auto; -webkit-overflow-scrolling:touch;}',
+  '      table{display:block; overflow:auto; width:100%;}',
+  '      th,td{white-space:nowrap;}',
+  '      .card{padding:12px;}',
+  '      input,select,textarea{font-size:16px;} /* iOS zoom fix */',
+  '    }',
+  '',
+  '</style>',
+  '</head>',
+  '<body>',
+  '  <div class="shell">',
+  '    <div class="top">',
+  '      <div class="brand">',
+  '        <div class="logo">M</div>',
+  '        <div style="min-width:0">',
+  '          <div class="title">MarketiQ Admin</div>',
+  '          <div class="muted" id="status">Offline</div>',
+  '        </div>',
+  '      </div>',
+  '      <div class="pill">',
+  '        <span class="muted">Token</span>',
+  '        <input id="token" class="mono" placeholder="ADMIN_TOKEN" style="width:240px;padding:8px 10px;border-radius:999px" />',
+  '        <button id="saveToken" class="primary">ورود</button>',
+  '      </div>',
+  '    </div>',
+  '',
+  '    <div class="card" id="bootstrapCard">',
+  '      <div class="row">',
+  '        <div class="col">',
+  '          <div class="title" style="font-size:14px">تنظیمات اشتراک و محدودیت‌ها</div>',
+  '          <div class="muted">داده‌ها در D1 ذخیره می‌شوند و KV فقط کش/فالبک است.</div>',
+  '        </div>',
+  '      </div>',
+  '',
+  '      <div class="hr"></div>',
+  '',
+  '      <div class="row">',
+  '        <div class="col"><label>قیمت</label><input id="price" /></div>',
+  '        <div class="col"><label>واحد</label><input id="currency" /></div>',
+  '        <div class="col"><label>روز</label><input id="days" /></div>',
+  '      </div>',
+  '',
+  '      <div class="row" style="margin-top:10px">',
+  '        <div class="col"><label>سقف روزانه رایگان</label><input id="freeLimit" /></div>',
+  '        <div class="col"><label>سقف روزانه اشتراک</label><input id="subLimit" /></div>',
+  '        <div class="col"><label>سقف ماهانه</label><input id="monthlyLimit" /></div>',
+  '      </div>',
+  '',
+  '      <div style="margin-top:10px">',
+  '        <button id="saveCfg" class="ok">ذخیره</button>',
+  '        <span class="muted" id="cfgMsg" style="margin-right:10px"></span>',
+  '      </div>',
+  '    </div>',
+  '',
+  '    <div class="card">',
+  '      <div class="title" style="font-size:14px">🧠 مدیریت سبک‌ها (CRUD کامل)</div>',
+  '      <div class="muted">هر سبک: key + label + prompt. Mini App از همین لیست ساخته می‌شود.</div>',
+  '',
+  '      <div class="hr"></div>',
+  '',
+  '      <div class="row">',
+  '        <div class="col">',
+  '          <label>انتخاب سبک</label>',
+  '          <select id="stylePick"></select>',
+  '        </div>',
+  '        <div class="col">',
+  '          <label>کلید (key)</label>',
+  '          <input id="styleKey" class="mono" placeholder="مثلاً ict" />',
+  '        </div>',
+  '        <div class="col">',
+  '          <label>نام نمایشی (label)</label>',
+  '          <input id="styleLabel" placeholder="مثلاً ICT" />',
+  '        </div>',
+  '        <div class="col">',
+  '          <label>مرتب‌سازی (sort)</label>',
+  '          <input id="styleSort" placeholder="مثلاً 10" />',
+  '        </div>',
+  '        <div class="col">',
+  '          <label>وضعیت</label>',
+  '          <select id="styleEnabled"><option value="1">فعال</option><option value="0">غیرفعال</option></select>',
+  '        </div>',
+  '      </div>',
+  '',
+  '      <div style="margin-top:10px">',
+  '        <label>Prompt</label>',
+  '        <textarea id="stylePrompt" placeholder="پرامپت این سبک"></textarea>',
+  '      </div>',
+  '',
+  '      <div style="margin-top:10px">',
+  '        <button id="styleSave" class="primary">ذخیره/ایجاد</button>',
+  '        <button id="styleDelete" class="danger">حذف</button>',
+  '        <span class="muted" id="styleMsg" style="margin-right:10px"></span>',
+  '      </div>',
+  '    </div>',
+  '',
+  '    <div class="card">',
+  '      <div class="title" style="font-size:14px">🖼️ بنر داخل اپ (R2)</div>',
+  '      <div class="muted">آپلود با URL → ذخیره در R2 → انتخاب بنر فعال</div>',
+  '',
+  '      <div class="hr"></div>',
+  '',
+  '      <div class="row">',
+  '        <div class="col"><label>URL تصویر</label><input id="bannerUrl" placeholder="https://.../banner.jpg" /></div>',
+  '        <div class="col"><label>کلید (اختیاری)</label><input id="bannerKey" class="mono" placeholder="مثلاً offer_1" /></div>',
+  '        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="bannerUpload" class="primary">آپلود به R2</button></div>',
+  '      </div>',
+  '',
+  '      <div style="margin-top:10px" class="row">',
+  '        <div class="col">',
+  '          <label>بنرهای موجود</label>',
+  '          <select id="bannerPick"></select>',
+  '        </div>',
+  '        <div class="col" style="min-width:180px">',
+  '          <label>&nbsp;</label>',
+  '          <button id="bannerActivate" class="ok">فعال کن</button>',
+  '        </div>',
+  '      </div>',
+  '',
+  '      <div style="margin-top:10px">',
+  '        <img id="bannerPreview" class="preview" alt="preview" />',
+  '        <div class="muted" style="margin-top:8px">آدرس سرو: <span id="bannerServe" class="mono"></span></div>',
+  '      </div>',
+  '    </div>',
+  '',
+  '    <div class="card">',
+  '      <div class="title" style="font-size:14px">💸 کمیسیون رفرال (بر اساس code یا username)</div>',
+  '      <div class="muted">برای بعضی لینک‌ها درصد متفاوت می‌گذاریم. اولویت: override روی code → override روی user → نرخ پیش‌فرض.</div>',
+  '',
+  '      <div class="hr"></div>',
+  '',
+  '      <div class="row">',
+  '        <div class="col"><label>Referral Code (start=...)</label><input id="commCode" class="mono" placeholder="mqxxxx" /></div>',
+  '        <div class="col"><label>یا Username</label><input id="commUser" class="mono" placeholder="@username یا username" /></div>',
+  '        <div class="col"><label>درصد (0..100) / خالی = حذف</label><input id="commPct" placeholder="مثلاً 12.5" /></div>',
+  '        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="commSave" class="primary">ذخیره</button></div>',
+  '      </div>',
+  '      <div class="muted" id="commMsg" style="margin-top:8px"></div>',
+  '    </div>',
+  '  </div>',
+  '',
+  '  <div id="toast" class="toast"></div>',
+  '  <script src="/admin.js"></script>',
+  '</body>',
+  '</html>',
+].join('\n');
+const ADMIN_APP_JS = `function __stubEl(){
+  const noop=()=>{};
+  return {
+    addEventListener: noop,
+    removeEventListener: noop,
+    dispatchEvent: noop,
+    appendChild: noop,
+    removeChild: noop,
+    setAttribute: noop,
+    removeAttribute: noop,
+    focus: noop,
+    click: noop,
+    querySelector: ()=>null,
+    querySelectorAll: ()=>[],
+    classList: {add:noop, remove:noop, toggle:noop, contains:()=>false},
+    style: {},
+    dataset: {},
+    get value(){return "";}, set value(v){},
+    get textContent(){return "";}, set textContent(v){},
+    get innerHTML(){return "";}, set innerHTML(v){}
+  };
+}
+function _el(id){
+  const n = document.getElementById(id);
+  if(n) return n;
+  if(!window.__EL_STUB) window.__EL_STUB = __stubEl();
+  return window.__EL_STUB;
+}
+const el = _el;
+const $ = _el;
+if(typeof window!=='undefined'){ window.el = el; window.$ = window.$ || $; }
+var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+if (tg && tg.ready) tg.ready();
+const out = document.getElementById("out");
+const meta = document.getElementById("meta");
+const sub = document.getElementById("sub");
+const pillTxt = document.getElementById("pillTxt");
+const welcome = document.getElementById("welcome");
+
+function val(id){
+  const n = _el(id);
+  return (n && typeof n.value !== "undefined") ? n.value : "";
+}
+function setVal(id, v){
+  const n = _el(id);
+  if(n && typeof n.value !== "undefined") n.value = v;
+}
+
+const toast = el("toast");
+const toastT = el("toastT");
+const toastS = el("toastS");
+const toastB = el("toastB");
+const spin = el("spin");
+
+let ALL_SYMBOLS = [];
+
+function showToast(title, subline = "", badge = "", loading = false){
+  toastT.textContent = title || "";
+  toastS.textContent = subline || "";
+  toastB.textContent = badge || "";
+  spin.style.display = loading ? "inline-block" : "none";
+  toast.classList.add("show");
+}
+function hideToast(){ toast.classList.remove("show"); }
+
+function fillSymbols(list){
+  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of ALL_SYMBOLS) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;
+}
+
+function fillStyles(list, selectedKeyOrLabel){
+  const sel = el("style");
+  if(!sel) return;
+  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];
+  if(!items.length) return;
+
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for(const it of items){
+    const o = document.createElement("option");
+    o.value = it.key;
+    o.textContent = it.label;
+    sel.appendChild(o);
+  }
+
+  // Prefer server-provided styleKey, otherwise keep current, otherwise try match by label
+  const prefer = (selectedKeyOrLabel || "").toString().trim();
+  if(prefer && items.some(x=>x.key===prefer)) sel.value = prefer;
+  else if(cur && items.some(x=>x.key===cur)) sel.value = cur;
+  else {
+    const byLabel = items.find(x=>x.label===prefer);
+    if(byLabel) sel.value = byLabel.key;
+  }
+}
+
+function renderStyleCards(list, selectedKey){
+  const wrap = el("styleCards");
+  const sel = el("style");
+  if(!wrap || !sel) return;
+
+  const items = Array.isArray(list) ? list.filter(x=>x && x.key && x.label) : [];
+  wrap.innerHTML = "";
+  if(!items.length) return;
+
+  const cur = (selectedKey || sel.value || "").toString();
+  for(const it of items){
+    const card = document.createElement("div");
+    card.className = "sCard" + (it.key === cur ? " on" : "");
+    card.dataset.key = it.key;
+
+    const ic = document.createElement("div");
+    ic.className = "sIcon";
+    const ch = (it.label || it.key || "?").toString().trim().charAt(0) || "?";
+    ic.textContent = ch;
+
+    const meta = document.createElement("div");
+    meta.className = "sMeta";
+
+    const nm = document.createElement("div");
+    nm.className = "sName";
+    nm.textContent = it.label;
+
+    const ky = document.createElement("div");
+    ky.className = "sKey";
+    ky.textContent = it.key;
+
+    meta.appendChild(nm);
+    meta.appendChild(ky);
+
+    card.appendChild(ic);
+    card.appendChild(meta);
+
+    card.addEventListener("click", () => {
+      sel.value = it.key;
+      const all = wrap.querySelectorAll(".sCard");
+      for(const n of all) n.classList.remove("on");
+      card.classList.add("on");
+    });
+
+    wrap.appendChild(card);
+  }
+}
+
+function renderBanner(url){
+  const wrap = el("bannerWrap");
+  const img = el("bannerImg");
+  if(!wrap || !img) return;
+  if(url){
+    img.src = url;
+    wrap.style.display = "block";
+  }else{
+    wrap.style.display = "none";
+  }
+}
+
+function filterSymbols(q){
+  q = (q || "").trim().toUpperCase();
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
+
+  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));
+  for (const s of list) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && list.includes(cur)) sel.value = cur;
+}
+
+function setTf(tf){
+  setVal("timeframe", tf);
+  const chips = (el("tfChips") ? el("tfChips").querySelectorAll(".chip") : []) || [];
+  for (const c of chips) c.classList.toggle("on", c.dataset.tf === tf);
+}
+
+async function api(path, body){
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"content-type":"application/json"},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => null);
+  return { status: r.status, json: j };
+}
+
+function prettyErr(j, status){
+  const e = j?.error || "نامشخص";
+  if (String(e) === "auth_failed") return "این مینی‌اپ فقط داخل تلگرام کار می‌کند.";
+  if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
+  if (status === 403 && (String(e) === "onboarding_required" || String(e) === "onboarding_needed")) return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
+  if (status === 401) return "احراز هویت تلگرام ناموفق است. لطفاً مینی‌اپ را داخل تلگرام باز کنید.";
+  return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
+}
+
+function updateMeta(state, quota){
+  meta.textContent = "سهمیه: " + (quota || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Kyiv): " + (state?.dailyDate || "-");
+}
+
+function updateEnergy(energy){
+  const bar = el("energyBar");
+  const txt = el("energyTxt");
+  const subl = el("energySub");
+  if(!energy || !bar || !txt || !subl) return;
+
+  const d = energy.daily || {};
+  const m = energy.monthly || {};
+  const dLim = Number.isFinite(d.limit) ? d.limit : null;
+  const mLim = Number.isFinite(m.limit) ? m.limit : null;
+
+  // show primary as daily, fallback to monthly
+  const used = Number(d.used||0);
+  const lim = dLim || mLim || 1;
+  const pct = Math.max(0, Math.min(100, Math.round((used/lim)*100)));
+  bar.style.width = pct + "%";
+
+  txt.textContent = "روز: " + (d.used||0) + "/" + (dLim ?? "∞") + " | ماه: " + (m.used||0) + "/" + (mLim ?? "∞");
+  subl.textContent = "باقی‌مانده روز: " + ((d.remaining==null)?"∞":d.remaining) + " | باقی‌مانده ماه: " + ((m.remaining==null)?"∞":m.remaining);
+}
+
+function renderOffer(offer){
+  const wrap = el("offerWrap");
+  const text = el("offerText");
+  const btn = el("offerBtn");
+  const img = el("offerImg");
+  if(!wrap || !text || !btn) return;
+  if(!offer || !offer.enabled || (!offer.text && !offer.image)){
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "block";
+  text.textContent = offer.text || "";
+  if(img){
+    if(offer.image){
+      img.src = offer.image;
+      img.style.display = "block";
+      img.onclick = ()=>{
+        if(offer.url){
+          try{ if((tg && tg.openLink)) tg.openLink(offer.url); else window.open(offer.url, "_blank"); }catch(e){}
+        }
+      };
+    } else {
+      img.style.display = "none";
+    }
+  }
+  if(offer.url){
+    btn.style.display = "inline-flex";
+    btn.onclick = ()=>{
+      try{ if((tg && tg.openLink)) tg.openLink(offer.url); else window.open(offer.url, "_blank"); }catch(e){}
+    };
+  } else {
+    btn.style.display = "none";
+  }
+}
+
+function renderProfile(profile){
+  const box = el("profileOut");
+  const metaEl = el("profileMeta");
+  if(!box) return;
+  const ref = (profile && profile.refLink) ? ("\\n🔗 رفرال: " + profile.refLink) : "";
+  box.textContent = "⭐ امتیاز: " + (profile && profile.points != null ? profile.points : 0) + "\n🎁 دعوت موفق: " + (profile && profile.invites != null ? profile.invites : 0) + ref + "\n💰 موجودی: " + (profile && profile.balance != null ? profile.balance : 0);
+  if(metaEl) metaEl.textContent = "Profile";
+  if(el("bep20") && profile && profile.bep20Address) el("bep20").value = profile.bep20Address;
+}
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  if (!tg) {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "این مینی‌اپ فقط داخل تلگرام کار می‌کند. از داخل ربات روی «🧩 مینی‌اپ» بزن.";
+    showToast("فقط داخل تلگرام", "از داخل ربات باز کن", "TG", false);
+    return;
+  }
+
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/user", { initData});
+
+  if (!json?.ok) {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, "API", false);
+    return;
+  }
+
+  welcome.textContent = json.welcome || "";
+  fillSymbols(json.symbols || []);
+  fillStyles(json.styles || [], (json.styleKey || (json.state && json.state.style) || ""));
+  renderStyleCards(json.styles || [], el("style").value);
+  renderBanner(json.bannerUrl || "");
+  renderOffer(json.offer);
+  updateEnergy(json.energy);
+  renderProfile(json.profile);
+  if(el("cpInfo")) el("cpInfo").textContent = json.infoText || "";
+  if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: " + (json.customPrompt?.status || "none");
+  if (json.state?.timeframe) setTf(json.state.timeframe);
+  if (json.state?.style) setVal("style", json.state.style);
+  if (json.state?.risk) setVal("risk", json.state.risk);
+  setVal("newsEnabled", String(!!json.state?.newsEnabled));
+
+  if (json.symbols?.length) setVal("symbol", json.symbols[0]);
+
+  updateMeta(json.state, json.quota);
+  out.textContent = "آماده ✅";
+  pillTxt.textContent = "Online";
+  hideToast();
+}
+
+el("q")?.addEventListener("input", (e) => filterSymbols(e.target.value));
+
+el("tfChips")?.addEventListener("click", (e) => {
+  const chip = ((e.target && e.target.closest) ? e.target.closest(".chip") : null);
+  const tf = chip?.dataset?.tf;
+  if (!tf) return;
+  setTf(tf);
+});
+
+el("save")?.addEventListener("click", async () => {
+  showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
+  out.textContent = "⏳ ذخیره تنظیمات…";
+
+  const initData = tg?.initData || "";
+  const payload = {
+    initData,
+    timeframe: val("timeframe"),
+    style: val("style"),
+    risk: val("risk"),
+    newsEnabled: val("newsEnabled") === "true",
+  };
+
+  const {status, json} = await api("/api/settings", payload);
+  if (!json?.ok) {
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, "SET", false);
+    return;
+  }
+
+  out.textContent = "✅ تنظیمات ذخیره شد.";
+  updateMeta(json.state, json.quota);
+  showToast("ذخیره شد ✅", "تنظیمات اعمال شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("analyze")?.addEventListener("click", async () => {
+  showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
+  out.textContent = "⏳ در حال تحلیل…";
+
+  const initData = tg?.initData || "";
+  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
+
+  const {status, json} = await api("/api/analyze", payload);
+  if (!json?.ok) {
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, status === 429 ? "Quota" : "AI", false);
+    return;
+  }
+
+  out.textContent = json.result || "⚠️ بدون خروجی";
+  updateMeta(json.state, json.quota);
+  showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("close")?.addEventListener("click", () => tg?.close());
+
+// Wallet + custom prompt actions
+const saveBep20Btn = document.getElementById("saveBep20"); if (saveBep20Btn) saveBep20Btn.addEventListener("click", async ()=>{
+  showToast("در حال ثبت…", "ذخیره آدرس BEP20", "WAL", true);
+  const initData = tg?.initData || "";
+  const address = val("bep20");
+  const {status, json} = await api("/api/wallet/set_bep20", { initData, address });
+  if(!json?.ok){
+    const msg = (json?.error === "invalid_bep20") ? "آدرس نامعتبر است." : prettyErr(json, status);
+    showToast("خطا", msg, "WAL", false);
+    out.textContent = "⚠️ " + msg;
+    return;
+  }
+  showToast("ثبت شد ✅", "آدرس BEP20 ذخیره شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("reqDeposit")?.addEventListener("click", async ()=>{
+  showToast("ثبت درخواست…", "درخواست واریز ارسال می‌شود", "DEP", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/wallet/request_deposit", { initData});
+  if(!json?.ok){
+    const msg = prettyErr(json, status);
+    showToast("خطا", msg, "DEP", false);
+    return;
+  }
+  showToast("ارسال شد ✅", "درخواست واریز ثبت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("reqWithdraw")?.addEventListener("click", async ()=>{
+  showToast("ثبت درخواست…", "درخواست برداشت بررسی می‌شود", "WD", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/wallet/request_withdraw", { initData});
+  if(!json?.ok){
+    const msg = (json?.error === "bep20_required") ? "برای برداشت ابتدا آدرس BEP20 را ثبت کن." : prettyErr(json, status);
+    showToast("خطا", msg, "WD", false);
+    out.textContent = "⚠️ " + msg;
+    return;
+  }
+  showToast("ارسال شد ✅", "درخواست برداشت ثبت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("cpReq")?.addEventListener("click", async ()=>{
+  const desc = (el("cpDesc")?.value || "").trim();
+  if(desc.length < 10){
+    showToast("توضیح کوتاه است", "لطفاً جزئیات بیشتری بنویس", "CP", false);
+    return;
+  }
+  showToast("در حال ارسال…", "پرامپت شما ساخته می‌شود", "CP", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/custom_prompt/request", { initData, desc });
+  if(!json?.ok){
+    const msg = (json?.error === "desc_too_short") ? (json?.info || "توضیح کوتاه است") : prettyErr(json, status);
+    showToast("خطا", msg, "CP", false);
+    return;
+  }
+  if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: pending | آماده پس از: " + (json.readyAt || "—");
+  showToast("ثبت شد ✅", "۲ ساعت بعد ارسال می‌شود", "OK", false);
+  setTimeout(hideToast, 1400);
+});
+
 boot();`
+
+
+function renderOffer(offer){
+  const wrap = el("offerWrap");
+  const text = el("offerText");
+  const btn = el("offerBtn");
+  const img = el("offerImg");
+  if(!wrap || !text || !btn) return;
+  if(!offer || !offer.enabled || (!offer.text && !offer.image)){
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "block";
+  text.textContent = offer.text || "";
+  if(img){
+    if(offer.image){
+      img.src = offer.image;
+      img.style.display = "block";
+      img.onclick = ()=>{
+        if(offer.url){
+          try{ if(tg && typeof tg.openLink==="function") tg.openLink(offer.url); else window.open(offer.url, "_blank"); }catch(e){}
+        }
+      };
+    } else {
+      img.style.display = "none";
+    }
+  }
+  if(offer.url){
+    btn.style.display = "inline-flex";
+    btn.onclick = ()=>{
+      try{ if(tg && typeof tg.openLink==="function") tg.openLink(offer.url); else window.open(offer.url, "_blank"); }catch(e){}
+    };
+  } else {
+    btn.style.display = "none";
+  }
+}
+
+function renderProfile(profile){
+  const box = el("profileOut");
+  const metaEl = el("profileMeta");
+  if(!box) return;
+  const ref = (profile && profile.refLink) ? ("\\n🔗 رفرال: " + profile.refLink) : "";
+  if(metaEl) metaEl.textContent = "Profile";
+  if(el("bep20") && profile && profile.bep20Address) el("bep20").value = profile.bep20Address;
+}
+
+async function boot(){
+  // If opened outside Telegram, don't hang on "connecting"
+  if(!tg || !tg.initData){
+    el("conn").textContent = "برای استفاده، مینی‌اپ را داخل تلگرام باز کنید.";
+    el("connDot").className = "dot off";
+    // still allow basic UI (no API calls)
+    return;
+  }
+
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  if (!tg) {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "این مینی‌اپ فقط داخل تلگرام کار می‌کند. از داخل ربات روی «🧩 مینی‌اپ» بزن.";
+    showToast("فقط داخل تلگرام", "از داخل ربات باز کن", "TG", false);
+    return;
+  }
+
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/user", { initData});
+
+  if (!json?.ok) {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, "API", false);
+    return;
+  }
+
+  welcome.textContent = json.welcome || "";
+  fillSymbols(json.symbols || []);
+  fillStyles(json.styles || [], (json.styleKey || (json.state && json.state.style) || ""));
+  renderStyleCards(json.styles || [], el("style").value);
+
+  // live refresh catalogs when admin changes (version bump)
+  try{
+    window.__stylesVer = String(json.stylesVersion || "0");
+    window.__bannersVer = String(json.bannersVersion || "0");
+    if(!window.__catalogPoll){
+      window.__catalogPoll = setInterval(async ()=>{
+        try{
+          const u = await api("/api/user", { initData: STATE.initData });
+          if(!u || !u.ok) return;
+
+          const nv = String(u.stylesVersion || "0");
+          if(nv && nv !== window.__stylesVer){
+            window.__stylesVer = nv;
+            fillStyles(u.styles || []);
+            renderStyleCards(u.styles || [], el("style").value);
+          }
+
+          const bv = String(u.bannersVersion || "0");
+          if(bv && bv !== window.__bannersVer){
+            window.__bannersVer = bv;
+            renderBanner(u.bannerUrl || "");
+          }
+        }catch(_e){}
+      }, 45000);
+    }
+  }catch(_e){}
+
+  renderBanner(json.bannerUrl || "");
+  renderOffer(json.offer);
+  updateEnergy(json.energy);
+  renderProfile(json.profile);
+  if(el("cpInfo")) el("cpInfo").textContent = json.infoText || "";
+  if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: " + (json.customPrompt?.status || "none");
+  if (json.state?.timeframe) setTf(json.state.timeframe);
+  if (json.state?.style) setVal("style", json.state.style);
+  if (json.state?.risk) setVal("risk", json.state.risk);
+  setVal("newsEnabled", String(!!json.state?.newsEnabled));
+
+  if (json.symbols?.length) setVal("symbol", json.symbols[0]);
+
+  updateMeta(json.state, json.quota);
+  out.textContent = "آماده ✅";
+  pillTxt.textContent = "Online";
+  hideToast();
+}
+
+el("q")?.addEventListener("input", (e) => filterSymbols(e.target.value));
+
+el("tfChips")?.addEventListener("click", (e) => {
+  const chip = ((e.target && e.target.closest) ? e.target.closest(".chip") : null);
+  const tf = chip?.dataset?.tf;
+  if (!tf) return;
+  setTf(tf);
+});
+
+el("save")?.addEventListener("click", async () => {
+  showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
+  out.textContent = "⏳ ذخیره تنظیمات…";
+
+  const initData = tg?.initData || "";
+  const payload = {
+    initData,
+    timeframe: val("timeframe"),
+    style: val("style"),
+    risk: val("risk"),
+    newsEnabled: val("newsEnabled") === "true",
+  };
+
+  const {status, json} = await api("/api/settings", payload);
+  if (!json?.ok) {
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, "SET", false);
+    return;
+  }
+
+  out.textContent = "✅ تنظیمات ذخیره شد.";
+  updateMeta(json.state, json.quota);
+  showToast("ذخیره شد ✅", "تنظیمات اعمال شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("analyze")?.addEventListener("click", async () => {
+  showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
+  out.textContent = "⏳ در حال تحلیل…";
+
+  const initData = tg?.initData || "";
+  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
+
+  const {status, json} = await api("/api/analyze", payload);
+  if (!json?.ok) {
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, status === 429 ? "Quota" : "AI", false);
+    return;
+  }
+
+  out.textContent = json.result || "⚠️ بدون خروجی";
+  // Render chart image (QuickChart) + structured JSON (zones/levels)
+  try{
+    const img = el("chartImg");
+    const meta = el("chartMeta");
+    const jbox = el("jsonOut");
+    if(meta) meta.textContent = (val("symbol") || "").toUpperCase();
+    if(img){
+      if(json.chartUrl){ img.src = json.chartUrl; img.style.display = "block"; }
+      else { img.style.display = "none"; }
+    }
+    if(jbox){
+      if(json.modelJson){ jbox.value = JSON.stringify(json.modelJson, null, 2); jbox.style.display = "block"; }
+      else { jbox.style.display = "none"; }
+    }
+  }catch(_e){}
+  updateMeta(json.state, json.quota);
+  showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("close")?.addEventListener("click", () => tg?.close());
+
+// Wallet + custom prompt actions
+const saveBep20Btn = document.getElementById("saveBep20"); if (saveBep20Btn) saveBep20Btn.addEventListener("click", async ()=>{
+  showToast("در حال ثبت…", "ذخیره آدرس BEP20", "WAL", true);
+  const initData = tg?.initData || "";
+  const address = val("bep20");
+  const {status, json} = await api("/api/wallet/set_bep20", { initData, address });
+  if(!json?.ok){
+    const msg = (json?.error === "invalid_bep20") ? "آدرس نامعتبر است." : prettyErr(json, status);
+    showToast("خطا", msg, "WAL", false);
+    out.textContent = "⚠️ " + msg;
+    return;
+  }
+  showToast("ثبت شد ✅", "آدرس BEP20 ذخیره شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("reqDeposit")?.addEventListener("click", async ()=>{
+  showToast("ثبت درخواست…", "درخواست واریز ارسال می‌شود", "DEP", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/wallet/request_deposit", { initData});
+  if(!json?.ok){
+    const msg = prettyErr(json, status);
+    showToast("خطا", msg, "DEP", false);
+    return;
+  }
+  showToast("ارسال شد ✅", "درخواست واریز ثبت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("reqWithdraw")?.addEventListener("click", async ()=>{
+  showToast("ثبت درخواست…", "درخواست برداشت بررسی می‌شود", "WD", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/wallet/request_withdraw", { initData});
+  if(!json?.ok){
+    const msg = (json?.error === "bep20_required") ? "برای برداشت ابتدا آدرس BEP20 را ثبت کن." : prettyErr(json, status);
+    showToast("خطا", msg, "WD", false);
+    out.textContent = "⚠️ " + msg;
+    return;
+  }
+  showToast("ارسال شد ✅", "درخواست برداشت ثبت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("cpReq")?.addEventListener("click", async ()=>{
+  const desc = (el("cpDesc")?.value || "").trim();
+  if(desc.length < 10){
+    showToast("توضیح کوتاه است", "لطفاً جزئیات بیشتری بنویس", "CP", false);
+    return;
+  }
+  showToast("در حال ارسال…", "پرامپت شما ساخته می‌شود", "CP", true);
+  const initData = tg?.initData || "";
+  const {status, json} = await api("/api/custom_prompt/request", { initData, desc });
+  if(!json?.ok){
+    const msg = (json?.error === "desc_too_short") ? (json?.info || "توضیح کوتاه است") : prettyErr(json, status);
+    showToast("خطا", msg, "CP", false);
+    return;
+  }
+  if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: pending | آماده پس از: " + (json.readyAt || "—");
+  showToast("ثبت شد ✅", "۲ ساعت بعد ارسال می‌شود", "OK", false);
+  setTimeout(hideToast, 1400);
+});
+
+boot();
+`;
 
 /* ========================== SUPPORT TICKETS ========================== */
 function uuid(){
@@ -6637,5 +7142,3 @@ async function listTickets(env, {userId, limit=10}){
     id:r.id, status:r.status, message:r.message, createdAt:r.created_at, updatedAt:r.updated_at
   }))};
 }
-
-;

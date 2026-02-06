@@ -2632,7 +2632,8 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs, env){
 async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
   if(!symbol.endsWith("USDT")) return null;
   const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
+
+
   const cacheKey = new Request(url, { method: "GET" });
 
   if(cache){
@@ -2946,7 +2947,6 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
       `&category=${encodeURIComponent(cat)}` +
       `&timeframe=${encodeURIComponent(tf)}`;
 
-    const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
     const cacheKey = new Request(url, { method: "GET" });
     if(cache){
       try{
