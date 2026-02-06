@@ -2621,15 +2621,18 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs, env){
 async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
   if(!symbol.endsWith("USDT")) return null;
   const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
   const cacheKey = new Request(url, { method: "GET" });
 
-  try{
-    const cached = await caches.default.match(cacheKey);
-    if(cached){
-      const j = await cached.json().catch(()=>null);
-      if(j) return j;
-    }
-  }catch{}
+  if(cache){
+    try{
+      const cached = await cache.match(cacheKey);
+      if(cached){
+        const j = await cached.json().catch(()=>null);
+        if(j) return j;
+      }
+    }catch{}
+  }
 
   const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
   if(!r.ok) throw new Error(`binance_ticker_http_${r.status}`);
@@ -2644,9 +2647,11 @@ async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
     vol: Number(j.volume),
   };
 
-  caches.default.put(cacheKey, new Response(JSON.stringify(data), {
-    headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${cacheTtlSec}` }
-  })).catch(()=>{});
+  if(cache){
+    cache.put(cacheKey, new Response(JSON.stringify(data), {
+      headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${cacheTtlSec}` }
+    })).catch(()=>{});
+  }
 
   return data;
 }
@@ -2748,7 +2753,7 @@ async function getMarketCandlesWithFallbackMeta(env, symbol, timeframe){
 
   // Layer 1: edge cache (very short)
   const cacheTtlSec = toInt(env.MARKET_CACHE_TTL_SEC, 20);
-  const cache = (typeof caches !== "undefined") ? caches.default : null;
+  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
   const cacheKey = cache
     ? new Request(`https://cache.local/market?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(timeframe)}&limit=${limit}`)
     : null;
@@ -2930,14 +2935,17 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
       `&category=${encodeURIComponent(cat)}` +
       `&timeframe=${encodeURIComponent(tf)}`;
 
+    const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
     const cacheKey = new Request(url, { method: "GET" });
-    try{
-      const cached = await caches.default.match(cacheKey);
-      if(cached){
-        const j = await cached.json().catch(()=>null);
-        if(Array.isArray(j)) return j;
-      }
-    }catch{}
+    if(cache){
+      try{
+        const cached = await cache.match(cacheKey);
+        if(cached){
+          const j = await cached.json().catch(()=>null);
+          if(Array.isArray(j)) return j;
+        }
+      }catch{}
+    }
 
     const timeoutMs = toInt(env.NEWS_TIMEOUT_MS, 6000);
     const r = await fetchWithTimeout(url, {}, timeoutMs);
@@ -2953,9 +2961,11 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
     })).filter(x => x.title);
 
     const ttl = toInt(env.NEWS_CACHE_TTL_SEC, 600);
-    caches.default.put(cacheKey, new Response(JSON.stringify(items), {
-      headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${ttl}` }
-    })).catch(()=>{});
+    if(cache){
+      cache.put(cacheKey, new Response(JSON.stringify(items), {
+        headers: { "content-type":"application/json; charset=utf-8", "cache-control": `public, max-age=${ttl}` }
+      })).catch(()=>{});
+    }
 
     return items;
   }catch(e){
