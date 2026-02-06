@@ -828,43 +828,41 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
         headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
         return new Response(obj.body, { status: 200, headers });
       }
-// ===== Telegram webhook route: /telegram/<secret> =====
+      // ===== Telegram webhook route: /telegram =====
       // نکته: تلگرام ریدایرکت (3xx) را قبول نمی‌کند؛ پس این مسیر باید مستقیم 200 بدهد.
-      // برای تست در مرورگر/پروکسی: GET/HEAD/OPTIONS همیشه 200 + ok (بدون نیاز به secret).
-      {
-        const p = url.pathname.replace(/\/+$/g, "");
-        if (p.startsWith("/telegram/")) {
-          const secret = p.split("/")[2] || "";
-          const m = request.method;
+      // برای تست در مرورگر/پروکسی: GET/HEAD/OPTIONS همیشه 200 + ok.
+      if (url.pathname.replace(/\/+$/g, "") === "/telegram") {
+        const m = request.method;
 
-          const okHeaders = {
-            "content-type": "text/plain; charset=utf-8",
-            "cache-control": "no-store",
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "POST, GET, OPTIONS",
-            "access-control-allow-headers": "content-type",
-          };
+        const okHeaders = {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "POST, GET, OPTIONS",
+          "access-control-allow-headers": "content-type, x-telegram-bot-api-secret-token",
+        };
 
-          // Browser/proxy preflight checks: always OK
-          if (m === "GET" || m === "HEAD" || m === "OPTIONS") {
-            return new Response("ok", { status: 200, headers: okHeaders });
-          }
-
-          // Only POST is a real Telegram update; require secret for POST.
-          const expected = String(env.TELEGRAM_WEBHOOK_SECRET || "Admin");
-          if (secret !== expected) {
-            return new Response("forbidden", { status: 403, headers: okHeaders });
-          }
-          if (m !== "POST") {
-            return new Response("ok", { status: 200, headers: okHeaders });
-          }
-
-          const update = await request.json().catch(() => null);
-          if (!update) return new Response("bad request", { status: 400, headers: okHeaders });
-
-          ctx.waitUntil(handleUpdate(update, env));
+        if (m === "GET" || m === "HEAD" || m === "OPTIONS") {
           return new Response("ok", { status: 200, headers: okHeaders });
         }
+
+        if (m !== "POST") {
+          return new Response("ok", { status: 200, headers: okHeaders });
+        }
+
+        const expected = String(env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+        if (expected) {
+          const got = String(request.headers.get("x-telegram-bot-api-secret-token") || "").trim();
+          if (got !== expected) {
+            return new Response("forbidden", { status: 403, headers: okHeaders });
+          }
+        }
+
+        const update = await request.json().catch(() => null);
+        if (!update) return new Response("bad request", { status: 400, headers: okHeaders });
+
+        ctx.waitUntil(handleUpdate(update, env));
+        return new Response("ok", { status: 200, headers: okHeaders });
       }
 
 if (env.ASSETS?.fetch) return env.ASSETS.fetch(request);
