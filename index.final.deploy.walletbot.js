@@ -5708,6 +5708,12 @@ const MINI_APP_HTML = [
   '          </div>',
   '',
   '          <div style="height:12px"></div>',
+  '          <div class="field">',
+  '            <div class="label">کامنت / توضیح تحلیل</div>',
+  '            <textarea id="comment" class="control" placeholder="اگر توضیح یا درخواست خاصی دارید اینجا بنویسید…" style="min-height:70px"></textarea>',
+  '          </div>',
+  '',
+  '          <div style="height:12px"></div>',
   '',
   '          <div class="actions">',
   '            <button id="save" class="btn">💾 ذخیره</button>',
@@ -5844,6 +5850,7 @@ function fillStyles(list, selectedKeyOrLabel){
   else {
     const byLabel = items.find(x=>x.label===prefer);
     if(byLabel) sel.value = byLabel.key;
+    else sel.value = items[0].key;
   }
 }
 
@@ -6055,7 +6062,6 @@ async function boot(){
   if(el("cpInfo")) el("cpInfo").textContent = json.infoText || "";
   if(el("cpStatus")) el("cpStatus").textContent = "وضعیت: " + (json.customPrompt?.status || "none");
   if (json.state?.timeframe) setTf(json.state.timeframe);
-  if (json.state?.style) setVal("style", json.state.style);
   if (json.state?.risk) setVal("risk", json.state.risk);
   setVal("newsEnabled", String(!!json.state?.newsEnabled));
 
@@ -6110,7 +6116,13 @@ el("analyze").addEventListener("click", async () => {
   out.textContent = "⏳ در حال تحلیل…";
 
   const initData = tg?.initData || "";
-  const payload = { initData, dev: DEV, userId: DEV ? DEV_UID : undefined, symbol: val("symbol"), userPrompt: "" };
+  const payload = {
+    initData,
+    dev: DEV,
+    userId: DEV ? DEV_UID : undefined,
+    symbol: val("symbol"),
+    userPrompt: (val("comment") || "").trim(),
+  };
 
   const {status, json} = await api("/api/analyze", payload);
   if (!json?.ok) {
