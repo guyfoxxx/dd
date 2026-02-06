@@ -906,7 +906,11 @@ const BTN = {
   EDUCATION: "📚 آموزش",
   REFERRAL: "🎁 دعوت دوستان",
   BUY: "💳 خرید اشتراک",
-  MINIAPP: "🧩 مینی‌اپ",
+  WALLET: "🏦 ولت",
+  WALLET_BALANCE: "💰 موجودی",
+  WALLET_SET: "🔗 ثبت آدرس ولت",
+  WALLET_DEPOSIT: "➕ درخواست واریز",
+  WALLET_WITHDRAW: "➖ درخواست برداشت",
   OWNER: "👑 گزارش اونر",
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
@@ -1145,29 +1149,12 @@ async function quotaText(st, from, env){
 function kb(rows){
   return { keyboard: rows, resize_keyboard:true, one_time_keyboard:false, input_field_placeholder:"از دکمه‌ها استفاده کن یا پیام بده…" };
 }
-function getMiniappUrl(env) {
-  env = env || {};
-  const raw = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || env.__BASE_URL || "").toString().trim();
-  if (!raw) return "";
-  return raw.replace(/\/+$/, "") + "/";
-}
-function miniappKey(env) {
-  const url = getMiniappUrl(env);
-  if (!url) return BTN.MINIAPP;
-  return { text: BTN.MINIAPP, web_app: { url } };
-}
-function appendMiniRow(rows, env) {
-  rows = rows || [];
-  rows.push([miniappKey(env)]);
-  return rows;
-}
 
 function requestContactKeyboard(env) {
   return {
     keyboard: [
       [{ text: "📱 ارسال شماره تماس", request_contact: true }],
       [BTN.BACK, BTN.HOME],
-      [miniappKey(env)],
     ],
     resize_keyboard: true,
     one_time_keyboard: true,
@@ -1179,6 +1166,7 @@ function mainMenuKeyboard(env) {
     [BTN.SIGNALS],
     [BTN.SETTINGS, BTN.PROFILE],
     [BTN.REFERRAL, BTN.BUY],
+    [BTN.WALLET],
     [BTN.EDUCATION, BTN.SUPPORT],
   ];
   // owner-only row
@@ -1187,7 +1175,6 @@ function mainMenuKeyboard(env) {
   }catch(_e){}
   // real owner-only row appended in appendOwnerRow
   appendOwnerRow(rows, env);
-  appendMiniRow(rows, env);
   return kb(rows);
 }
 
@@ -1207,7 +1194,6 @@ function signalsMenuKeyboard(env) {
     [BTN.CAT_INDICES],
     [BTN.BACK, BTN.HOME],
   ];
-  appendMiniRow(rows, env);
   return kb(rows);
 }
 
@@ -1218,7 +1204,6 @@ function settingsMenuKeyboard(env) {
     [BTN.SET_RISK, BTN.SET_NEWS],
     [BTN.BACK, BTN.HOME],
   ];
-  appendMiniRow(rows, env);
   return kb(rows);
 }
 
@@ -1226,7 +1211,6 @@ function listKeyboard(items, columns = 2, env) {
   const rows = [];
   for (let i = 0; i < items.length; i += columns) rows.push(items.slice(i, i + columns));
   rows.push([BTN.BACK, BTN.HOME]);
-  appendMiniRow(rows, env);
   return kb(rows);
 }
 
@@ -1234,8 +1218,14 @@ function optionsKeyboard(options, env) {
   const rows = [];
   for (let i = 0; i < options.length; i += 2) rows.push(options.slice(i, i + 2));
   rows.push([BTN.BACK, BTN.HOME]);
-  appendMiniRow(rows, env);
   return kb(rows);
+}
+function walletMenuKeyboard(env){
+  return kb([
+    [BTN.WALLET_BALANCE, BTN.WALLET_SET],
+    [BTN.WALLET_DEPOSIT, BTN.WALLET_WITHDRAW],
+    [BTN.BACK, BTN.HOME],
+  ]);
 }
 
 /* ========================== STATE (D1 + KV) ========================== */
@@ -3856,10 +3846,23 @@ if(cmd==="/customprompt" || cmd==="/prompt"){
 }
 
 
-    if(cmd==="/wallet"){
-      const w = await getWallet(env);
-      if(!w) return tgSendMessage(env, chatId, "فعلاً آدرس ولت تنظیم نشده است.", mainMenuKeyboard(env));
-      return tgSendMessage(env, chatId, `💳 آدرس ولت MarketiQ:\n\n\`${w}\``, mainMenuKeyboard(env));
+    if(cmd==="/wallet" || cmd==="/balance" || text===BTN.WALLET){
+      return sendWalletMenu(env, chatId, st);
+    }
+    if(cmd==="/deposit" || text===BTN.WALLET_DEPOSIT){
+      return handleWalletDepositRequest(env, chatId, st);
+    }
+    if(cmd==="/withdraw" || text===BTN.WALLET_WITHDRAW){
+      return handleWalletWithdrawRequest(env, chatId, st);
+    }
+    if(cmd==="/setbep20" || text===BTN.WALLET_SET){
+      st.state="wallet_set_bep20";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "آدرس BEP20 خود را ارسال کن (TRC/BEP):", kb([[BTN.BACK, BTN.HOME]]));
+    }
+    if(text===BTN.WALLET_BALANCE){
+      const msg = await walletSummaryText(st, env);
+      return tgSendMessage(env, chatId, msg, walletMenuKeyboard(env));
     }
 
     if(cmd==="/redeem"){
@@ -3934,26 +3937,13 @@ if(cmd==="/setrefpct"){
       return tgSendMessage(env, chatId, p ? `📌 پرامپت فعلی:\n\n${p}` : "پرامپت سفارشی تنظیم نشده؛ از پیش‌فرض استفاده می‌شود.", mainMenuKeyboard(env));
     }
 
-    // Back/Home
-    if(text === BTN.MINIAPP){
-      const url = getMiniappUrl(env);
-      if(url){
-        return tgSendMessage(env, chatId, "🔗 برای باز کردن مینی‌اپ روی دکمه زیر بزن:", {
-          reply_markup: {
-            inline_keyboard: [[{ text: "باز کردن مینی‌اپ", web_app: { url } }]]
-          }
-        });
-      }
-      return tgSendMessage(env, chatId, "⚠️ لینک مینی‌اپ تنظیم نشده. لطفاً PUBLIC_BASE_URL یا MINIAPP_URL را تنظیم کن.", mainMenuKeyboard(env));
-    }
-
-
     if(text===BTN.HOME){
       st.state="idle"; st.selectedSymbol=""; st.quiz={active:false, idx:0, answers:[]};
       await saveUser(userId, st, env);
       return tgSendMessage(env, chatId, "🏠 منوی اصلی:", mainMenuKeyboard(env));
     }
     if(text===BTN.BACK){
+      if(st.state==="wallet_set_bep20"){ st.state="idle"; await saveUser(userId, st, env); return sendWalletMenu(env, chatId, st); }
       if(st.state==="choose_style"){ st.state="choose_symbol"; st.selectedSymbol=""; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "🧭 مرحله ۱: بازار را انتخاب کن:", signalsMenuKeyboard(env)); }
       if(st.state.startsWith("set_")){ st.state="idle"; await saveUser(userId, st, env); return sendSettingsSummary(env, chatId, st, from); }
       if(st.state.startsWith("onboard_") || st.quiz?.active){ st.state="idle"; st.quiz={active:false, idx:0, answers:[]}; await saveUser(userId, st, env); return tgSendMessage(env, chatId, "متوقف شد. هر زمان خواستی دوباره از 🧪 تعیین سطح استفاده کن.", mainMenuKeyboard(env)); }
@@ -3975,6 +3965,16 @@ if(cmd==="/setrefpct"){
       await setVisionPromptTemplate(env, p);
       st.state="idle"; await saveUser(userId, st, env);
       return tgSendMessage(env, chatId, "✅ پرامپت ویژن ذخیره شد.", mainMenuKeyboard(env));
+    }
+
+    if(st.state==="wallet_set_bep20"){
+      const addr = String(text||"").trim();
+      if(addr.length < 10) return tgSendMessage(env, chatId, "آدرس نامعتبر است. دوباره ارسال کن یا ⬅️ برگشت.", kb([[BTN.BACK, BTN.HOME]]));
+      st.bep20Address = addr;
+      st.state="idle";
+      await saveUser(userId, st, env);
+      await tgSendMessage(env, chatId, "✅ آدرس ولت ذخیره شد.", walletMenuKeyboard(env));
+      return;
     }
 
     // Onboarding
@@ -4697,6 +4697,58 @@ async function profileText(st, from, env){
 درخواست‌های واریز: ${st.walletDepositRequests||0}
 درخواست‌های برداشت: ${st.walletWithdrawRequests||0}
 آدرس BEP20: ${st.bep20Address ? "`"+st.bep20Address+"`" : "— (برای برداشت لازم است)"}`;
+}
+
+async function walletSummaryText(st, env){
+  const wallet = await getWallet(env);
+  const walletLine = wallet ? `آدرس ولت اشتراک:\n\`${wallet}\`\n` : "آدرس ولت اشتراک هنوز تنظیم نشده است.\n";
+  return `🏦 کیف پول MarketiQ
+
+${walletLine}
+💰 موجودی: ${Number(st.walletBalance||0).toFixed(2)}
+➕ درخواست‌های واریز: ${st.walletDepositRequests||0}
+➖ درخواست‌های برداشت: ${st.walletWithdrawRequests||0}
+🔗 آدرس BEP20: ${st.bep20Address ? "`"+st.bep20Address+"`" : "— (برای برداشت لازم است)"}`;
+}
+
+async function sendWalletMenu(env, chatId, st){
+  const msg = await walletSummaryText(st, env);
+  return tgSendMessage(env, chatId, msg, walletMenuKeyboard(env));
+}
+
+async function handleWalletDepositRequest(env, chatId, st){
+  if(!isOnboardComplete(st)){
+    await tgSendMessage(env, chatId, "برای درخواست واریز، ابتدا پروفایل را تکمیل کن (نام + شماره).", mainMenuKeyboard(env));
+    return;
+  }
+  st.walletDepositRequests = (st.walletDepositRequests||0) + 1;
+  await saveUser(st.userId, st, env);
+  try{
+    const targets = managerL1Targets(env);
+    for(const a of targets){
+      await tgSendMessage(env, a, `💰 درخواست واریز\nuser=${st.userId}\nname=${st.profileName||"-"}\ncount=${st.walletDepositRequests}`, null).catch(()=>{});
+    }
+  }catch(_e){}
+  return tgSendMessage(env, chatId, "✅ درخواست واریز ثبت شد. بزودی بررسی می‌شود.", walletMenuKeyboard(env));
+}
+
+async function handleWalletWithdrawRequest(env, chatId, st){
+  if(!isOnboardComplete(st)){
+    await tgSendMessage(env, chatId, "برای درخواست برداشت، ابتدا پروفایل را تکمیل کن (نام + شماره).", mainMenuKeyboard(env));
+    return;
+  }
+  if(!st.bep20Address){
+    return tgSendMessage(env, chatId, "برای برداشت، ابتدا آدرس BEP20 خود را ثبت کن.", walletMenuKeyboard(env));
+  }
+  st.walletWithdrawRequests = (st.walletWithdrawRequests||0) + 1;
+  await saveUser(st.userId, st, env);
+  try{
+    const targets = managerL1Targets(env);
+    for(const a of targets){
+      await tgSendMessage(env, a, `🏦 درخواست برداشت\nuser=${st.userId}\nname=${st.profileName||"-"}\nBEP20=${st.bep20Address}\ncount=${st.walletWithdrawRequests}`, null).catch(()=>{});
+    }
+  }catch(_e){}
+  return tgSendMessage(env, chatId, "✅ درخواست برداشت ثبت شد. بزودی بررسی می‌شود.", walletMenuKeyboard(env));
 }
 
 /* ========================== LEVELING ========================== */
