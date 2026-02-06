@@ -2621,7 +2621,8 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs, env){
 async function fetchBinanceTicker24h(symbol, timeoutMs, cacheTtlSec=60){
   if(!symbol.endsWith("USDT")) return null;
   const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-  const cache = (typeof caches !== "undefined") ? caches.default : null;
+  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
+
   const cacheKey = new Request(url, { method: "GET" });
 
   if(cache){
@@ -2753,7 +2754,7 @@ async function getMarketCandlesWithFallbackMeta(env, symbol, timeframe){
 
   // Layer 1: edge cache (very short)
   const cacheTtlSec = toInt(env.MARKET_CACHE_TTL_SEC, 20);
-  const cache = (typeof caches !== "undefined") ? caches.default : null;
+  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
   const cacheKey = cache
     ? new Request(`https://cache.local/market?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(timeframe)}&limit=${limit}`)
     : null;
@@ -2934,8 +2935,7 @@ async function fetchNewsHeadlines(env, symbol, timeframe){
       `&language=${encodeURIComponent(lang)}` +
       `&category=${encodeURIComponent(cat)}` +
       `&timeframe=${encodeURIComponent(tf)}`;
-
-    const cache = (typeof caches !== "undefined") ? caches.default : null;
+    
     const cacheKey = new Request(url, { method: "GET" });
     if(cache){
       try{
