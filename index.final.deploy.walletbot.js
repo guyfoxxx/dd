@@ -43,7 +43,7 @@ function isManagerL2(env, userId){
 }
 // @ts-nocheck
 /*
-  MarketiQ Worker (single-file)
+  Market IQ Worker (single-file)
   v4 hotfix: define response helpers BEFORE export default.
   دلیل: در بعضی جریان‌های Build/Editor کلودفلر، اگر helper ها پایین فایل باشند،
   ممکن است در اولین اجرا ReferenceError بخورند.
@@ -92,14 +92,16 @@ export default {
       }
 
       // ===== Mini App (inline) =====
-      if (request.method === "GET" && url.pathname === "/") return htmlResponse(MINI_APP_HTML);
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/miniapp")) {
+        return htmlResponse(MINI_APP_HTML);
+      }
       if (request.method === "GET" && url.pathname === "/app.js") return jsResponse(MINI_APP_JS);
 
       if (request.method === "GET" && (url.pathname === "/admin" || url.pathname === "/admin/")) return htmlResponse(ADMIN_APP_HTML);
       if (request.method === "GET" && url.pathname === "/admin.js") return jsResponse(ADMIN_APP_JS);
 
       // ===== Mini App APIs =====
-      if (url.pathname === "/api/user" && request.method === "POST") {
+      if ((url.pathname === "/api/user" || url.pathname === "/api/profile") && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -221,7 +223,7 @@ export default {
         return jsonResponse({ ok: true, state: stPublic(st), quota });
       }
 
-if (url.pathname === "/api/analyze" && request.method === "POST") {
+      if ((url.pathname === "/api/analyze" || url.pathname === "/api/signals") && request.method === "POST") {
   const body = await request.json().catch(() => null);
   if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -287,6 +289,40 @@ if (url.pathname === "/api/analyze" && request.method === "POST") {
     return jsonResponse(payload, 500);
   }
 }
+
+      if (url.pathname === "/api/news" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+        const v = await authMiniApp(body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
+
+        const symbol = normalizeSymbol(body.symbol || st?.lastSymbol || "");
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+        const timeframe = sanitizeTf(body.timeframe || st?.timeframe || "H4") || "H4";
+
+        const headlines = await fetchNewsHeadlines(env, symbol, timeframe);
+        return jsonResponse({ ok: true, symbol, timeframe, headlines });
+      }
+
+      if (url.pathname === "/api/requests" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+        const v = await authMiniApp(body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: "auth_failed" }, 401);
+        const st = await ensureUser(v.userId, env, { username: v.fromLike?.username || "" });
+        if (!isOnboardComplete(st)) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
+
+        return jsonResponse({
+          ok: true,
+          state: {
+            bep20Address: st.bep20Address || "",
+            walletDepositRequests: st.walletDepositRequests || 0,
+            walletWithdrawRequests: st.walletWithdrawRequests || 0,
+          },
+        });
+      }
 
 
 
@@ -884,7 +920,7 @@ if (env.ASSETS?.fetch) return env.ASSETS.fetch(request);
 
       // For browser/MiniApp load: show a friendly fallback instead of raw "error"
       return htmlResponse(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8">
-<title>MarketiQ</title><body style="font-family:system-ui; padding:16px; line-height:1.8">
+<title>Market IQ</title><body style="font-family:system-ui; padding:16px; line-height:1.8">
 <h2>در حال بروزرسانی…</h2>
 <div>اگر از تلگرام وارد شدی، چند ثانیه بعد دوباره تلاش کن.</div>
 </body></html>`, 200);
@@ -898,7 +934,7 @@ if (env.ASSETS?.fetch) return env.ASSETS.fetch(request);
 };
 
  /* ========================== CONFIG ========================== */
-const BRAND = "MarketiQ";
+const BRAND = "Market IQ";
 
 const MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"];
 const METALS = ["XAUUSD", "XAGUSD"];
@@ -976,11 +1012,11 @@ const CUSTOM_PROMPT_INFO_TEXT = "استراتژی و سبک خود را بصور
 
 
 /* ========================== WELCOME TEXT ========================== */
-const WELCOME_TEXT = `👋 به MarketiQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
+const WELCOME_TEXT = `👋 به Market IQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
 
-📊 MarketiQ یک ایجنت تخصصی تحلیل بازارهای مالی است که با تمرکز بر تصمیم‌سازی هوشمند، در کنار شماست تا بازار را درست‌تر، عمیق‌تر و حرفه‌ای‌تر ببینید.
+📊 Market IQ یک ایجنت تخصصی تحلیل بازارهای مالی است که با تمرکز بر تصمیم‌سازی هوشمند، در کنار شماست تا بازار را درست‌تر، عمیق‌تر و حرفه‌ای‌تر ببینید.
 
-🔍 در MarketiQ چه دریافت می‌کنید؟
+🔍 در Market IQ چه دریافت می‌کنید؟
 
 ✅ تحلیل فاندامنتال بازارهای مالی
 ✅ تحلیل تکنیکال دقیق و ساختاریافته
@@ -996,7 +1032,7 @@ const WELCOME_TEXT = `👋 به MarketiQ خوش آمدید — هوش تحلیل
 📈 سهام
 
 
-🧠 فلسفه MarketiQ
+🧠 فلسفه Market IQ
 
 ما سیگنال نمی‌فروشیم، ما «درک بازار» می‌سازیم.
 هدف ما کمک به شما برای تصمیم‌گیری آگاهانه است، نه وابستگی کورکورانه به سیگنال.
@@ -1012,7 +1048,7 @@ const WELCOME_TEXT = `👋 به MarketiQ خوش آمدید — هوش تحلیل
 ⚠️ سلب مسئولیت: تمام تحلیل‌ها صرفاً جنبه آموزشی و تحلیلی دارند و مسئولیت نهایی معاملات بر عهده کاربر است.`;
 
 
-const MINI_APP_WELCOME_TEXT = `👋 به MarketiQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
+const MINI_APP_WELCOME_TEXT = `👋 به Market IQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
 این مینی‌اپ برای گرفتن تحلیل سریع، تنظیمات، و مدیریت دسترسی طراحی شده است.
 ⚠️ تحلیل‌ها آموزشی است و مسئولیت معاملات با شماست.`;
 
@@ -3033,7 +3069,7 @@ const STYLE_DEFAULT_PROMPTS = {
 4) پلن معامله: Trigger ورود، SL منطقی، اهداف، R:R
 5) سناریوی جایگزین در صورت شکست سطح`,
 
-  "روش اختصاصی": `شما تحلیل‌گر روش اختصاصی MarketiQ هستید:
+  "روش اختصاصی": `شما تحلیل‌گر روش اختصاصی Market IQ هستید:
 
 1) ترکیب روند + زون + تایمینگ (HTF→LTF)
 2) سه زون: Zone A (Accumulation)، Zone B (Decision)، Zone C (Expansion)
@@ -3106,7 +3142,7 @@ async function buildTextPromptForSymbol(env, symbol, userPrompt, st, marketBlock
   const tf = st.timeframe || "H4";
   const base = await buildBasePrompt(env, tf);
   const styleGuide = await getStylePrompt(env, st);
-  const userExtra = userPrompt?.trim() ? userPrompt.trim() : "تحلیل کامل طبق چارچوب MarketiQ";
+  const userExtra = userPrompt?.trim() ? userPrompt.trim() : "تحلیل کامل طبق چارچوب Market IQ";
   return `${base}\n\nASSET: ${symbol}\nUSER SETTINGS: Style=${st.style}, Risk=${st.risk}, Experience=${st.experience||"-"}, PreferredMarket=${st.preferredMarket||"-"}`
     + (styleGuide ? `\n\nSTYLE_GUIDE:\n${styleGuide}\n` : "\n")
     + `\nMARKET_DATA:\n${marketBlock}\n\nUSER EXTRA REQUEST:\n${userExtra}\n\nRULES:\n- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵\n- سطح‌های قیمتی را مشخص کن (X/Y/Z)\n- شرط کندلی را واضح بگو (close/wick)\n- از داده OHLC استفاده کن، خیال‌بافی نکن
@@ -3465,7 +3501,7 @@ async function evaluateLevelByAI(env, st){
   const score = scoreQuiz(answers);
 
   const prompt =
-`تو ارزیاب تعیین‌سطح MarketiQ هستی. خروجی فقط JSON و فارسی.
+`تو ارزیاب تعیین‌سطح Market IQ هستی. خروجی فقط JSON و فارسی.
 
 ورودی‌ها:
 - تجربه کاربر: ${st.experience||"-"}
@@ -3977,7 +4013,7 @@ if(cmd==="/customprompt" || cmd==="/prompt"){
     if(cmd==="/wallet"){
       const w = await getWallet(env);
       if(!w) return tgSendMessage(env, chatId, "فعلاً آدرس ولت تنظیم نشده است.", mainMenuKeyboard(env));
-      return tgSendMessage(env, chatId, `💳 آدرس ولت MarketiQ:\n\n\`${w}\``, mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, `💳 آدرس ولت Market IQ:\n\n\`${w}\``, mainMenuKeyboard(env));
     }
 
     if(cmd==="/redeem"){
@@ -4257,7 +4293,7 @@ if(st.state==="support_ticket_text"){
           await Promise.race([typingTask, sleep(10)]).catch(()=>{});
 
           const msgTxt =
-`✅ نتیجه تعیین سطح MarketiQ
+`✅ نتیجه تعیین سطح Market IQ
 
 👤 نام: ${st.profileName || "-"}
 📌 سطح: ${st.level}  (امتیاز: ${st.levelScore}/${QUIZ.length})
@@ -4553,7 +4589,7 @@ async function creditReferral(env, referrerId, invitedUserId){
 
   if(refSt.chatId){
     const msg =
-`🎉 معرفی موفق در MarketiQ
+`🎉 معرفی موفق در Market IQ
 
 ✅ یک کاربر جدید با موفقیت ثبت‌نام کرد.
 ➕ امتیاز دریافت‌شده: ${REF_POINTS_PER_SUCCESS}
@@ -4793,7 +4829,7 @@ async function profileText(st, from, env){
   const botUsername = (env.BOT_USERNAME || "").toString().replace(/^@/, "").trim();
   const code = Array.isArray(st.refCodes) && st.refCodes.length ? st.refCodes[0] : "";
   const refLink = (botUsername && code) ? `https://t.me/${botUsername}?start=${code}` : (code || "—");
-  return `👤 پروفایل MarketiQ
+  return `👤 پروفایل Market IQ
 
 وضعیت: ${roleTag}
 نام: ${st.profileName || "-"}
@@ -4826,7 +4862,7 @@ async function startLeveling(env, chatId, from, st){
   st.quiz={active:false, idx:0, answers:[]};
   st.state="onboard_experience";
   await saveUser(st.userId, st, env);
-  await tgSendMessage(env, chatId, "🧪 تعیین سطح MarketiQ\n\nسطح تجربه‌ات در بازار چقدر است؟", optionsKeyboard(["مبتدی","متوسط","حرفه‌ای"]));
+  await tgSendMessage(env, chatId, "🧪 تعیین سطح Market IQ\n\nسطح تجربه‌ات در بازار چقدر است؟", optionsKeyboard(["مبتدی","متوسط","حرفه‌ای"]));
 }
 async function startQuiz(env, chatId, st){
   st.quiz={ active:true, idx:0, answers:[] };
@@ -5419,7 +5455,7 @@ const MINI_APP_HTML = [
   '<head>',
   '  <meta charset="utf-8" />',
   '  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />',
-  '  <title>MarketiQ Mini App</title>',
+  '  <title>Market IQ Mini App</title>',
   '  <meta name="color-scheme" content="dark light" />',
   '  <style>',
   '    :root{',
@@ -5628,7 +5664,7 @@ const MINI_APP_HTML = [
   '      <div class="brand">',
   '        <div class="logo">MQ</div>',
   '        <div class="titlewrap">',
-  '          <div class="title">MarketiQ Mini App</div>',
+  '          <div class="title">Market IQ Mini App</div>',
   '          <div class="subtitle" id="sub">اتصال…</div>',
   '        </div>',
   '      </div>',
@@ -6212,7 +6248,7 @@ const ADMIN_APP_HTML = [
   '<head>',
   '  <meta charset="utf-8" />',
   '  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />',
-  '  <title>MarketiQ Admin</title>',
+  '  <title>Market IQ Admin</title>',
   '  <meta name="color-scheme" content="dark light" />',
   '  <style>',
   '    :root{',
@@ -6282,7 +6318,7 @@ const ADMIN_APP_HTML = [
   '      <div class="brand">',
   '        <div class="logo">M</div>',
   '        <div style="min-width:0">',
-  '          <div class="title">MarketiQ Admin</div>',
+  '          <div class="title">Market IQ Admin</div>',
   '          <div class="muted" id="status">Offline</div>',
   '        </div>',
   '      </div>',
