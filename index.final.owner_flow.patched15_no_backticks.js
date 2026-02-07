@@ -449,6 +449,8 @@ return jsonResponse({ ok: true });
         const freeLimit = await getFreeDailyLimit(env);
         const subLimit = await getSubDailyLimit(env);
         const monthlyLimit = await getMonthlyLimit(env);
+        const commissionRate = await getReferralCommissionRate(env);
+        const commissionRate = await getReferralCommissionRate(env);
         const offer = await getOfferConfig(env);
 
         return jsonResponse({ ok:true, config:{ wallet, price, currency, days, freeLimit, subLimit, monthlyLimit, offer }, role:{
@@ -639,7 +641,7 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
           }catch(_e){}
         }
 
-        return jsonResponse({ ok:true, config:{ wallet, price, currency, days, freeLimit, subLimit, monthlyLimit }, styles, banners });
+        return jsonResponse({ ok:true, config:{ wallet, price, currency, days, freeLimit, subLimit, monthlyLimit, commissionRate }, styles, banners });
       }
 
       if (url.pathname === "/api/admin2/config/set" && request.method === "POST") {
@@ -647,14 +649,123 @@ if (url.pathname === "/api/admin/refgen" && request.method === "POST") {
         const body = await request.json().catch(()=>null);
         if(!body) return jsonResponse({ ok:false, error:"bad_json" }, 400);
 
+        if(body.wallet !== undefined) await setWallet(env, String(body.wallet||"").trim(), { id:"admin_token" });
         if(body.price !== undefined) await setSubPrice(env, body.price);
         if(body.currency !== undefined) await setSubCurrency(env, body.currency);
         if(body.days !== undefined) await setSubDays(env, body.days);
         if(body.freeLimit !== undefined) await setFreeDailyLimit(env, body.freeLimit);
         if(body.subLimit !== undefined) await setSubDailyLimit(env, body.subLimit);
         if(body.monthlyLimit !== undefined) await setMonthlyLimit(env, body.monthlyLimit);
+        if(body.commissionRate !== undefined){
+          const n = Number(body.commissionRate);
+          if(!Number.isFinite(n) || n < 0 || n > 100) return jsonResponse({ ok:false, error:"bad_commission_rate" }, 400);
+          await setCfg(env, "ref_commission_rate", "cfg:ref_commission_rate", String(n));
+        }
 
         return jsonResponse({ ok:true });
+      }
+
+      if (url.pathname === "/api/admin2/report/summary" && request.method === "POST") {
+        if(!isAdminToken(request, env)) return jsonResponse({ ok:false, error:"forbidden" }, 403);
+        if(!hasD1(env)) return jsonResponse({ ok:false, error:"d1_required" }, 400);
+        await ensureD1Schema(env);
+
+        const now = nowIso();
+        const usersTotal = Number((await env.BOT_DB.prepare("SELECT COUNT(1) AS c FROM users").first())?.c || 0);
+        const usersActiveSub = Number((await env.BOT_DB.prepare(
+          "SELECT COUNT(1) AS c FROM users WHERE json_extract(data,'$.subActiveUntil') IS NOT NULL AND json_extract(data,'$.subActiveUntil') > ?1"
+        ).bind(now).first())?.c || 0);
+
+        const paymentsTotal = Number((await env.BOT_DB.prepare("SELECT COUNT(1) AS c FROM payments").first())?.c || 0);
+        const paymentsPending = Number((await env.BOT_DB.prepare("SELECT COUNT(1) AS c FROM payments WHERE status='pending'").first())?.c || 0);
+        const paymentsApproved = Number((await env.BOT_DB.prepare("SELECT COUNT(1) AS c FROM payments WHERE status='approved'").first())?.c || 0);
+        const paymentsRejected = Number((await env.BOT_DB.prepare("SELECT COUNT(1) AS c FROM payments WHERE status='rejected'").first())?.c || 0);
+
+        const revenueRow = await env.BOT_DB.prepare("SELECT SUM(json_extract(data,'$.amount')) AS amt FROM payments WHERE status='approved'").first().catch(()=>null);
+        const revenue = Number(revenueRow?.amt || 0);
+
+        const commissionRow = await env.BOT_DB.prepare("SELECT SUM(amount) AS amt FROM commissions WHERE status='due'").first().catch(()=>null);
+        const commissionDue = Number(commissionRow?.amt || 0);
+
+        return jsonResponse({
+          ok:true,
+          summary:{
+            usersTotal,
+            usersActiveSub,
+            paymentsTotal,
+            paymentsPending,
+            paymentsApproved,
+            paymentsRejected,
+            revenue,
+            commissionDue
+          }
+        });
+      }
+
+      if (url.pathname === "/api/admin2/users/list" && request.method === "POST") {
+        if(!isAdminToken(request, env)) return jsonResponse({ ok:false, error:"forbidden" }, 403);
+        if(!hasD1(env)) return jsonResponse({ ok:false, error:"d1_required" }, 400);
+        await ensureD1Schema(env);
+        const body = await request.json().catch(()=>null);
+        const limit = Math.min(100, Math.max(1, Number(body?.limit || 30)));
+        const rows = await env.BOT_DB.prepare("SELECT user_id, data, created_at, updated_at FROM users ORDER BY updated_at DESC LIMIT ?1").bind(limit).all();
+        const items = (rows?.results||[]).map(r=>{
+          const st = patchUser(safeJsonParse(r.data)||{}, r.user_id);
+          return {
+            userId: st.userId,
+            username: st.username || "",
+            name: st.profileName || "",
+            createdAt: r.created_at || st.createdAt || "",
+            updatedAt: r.updated_at || st.updatedAt || "",
+            subActiveUntil: st.subActiveUntil || "",
+            points: st.points || 0,
+            invites: st.successfulInvites || 0
+          };
+        });
+        return jsonResponse({ ok:true, items });
+      }
+
+      if (url.pathname === "/api/admin2/user/get" && request.method === "POST") {
+        if(!isAdminToken(request, env)) return jsonResponse({ ok:false, error:"forbidden" }, 403);
+        if(!hasD1(env)) return jsonResponse({ ok:false, error:"d1_required" }, 400);
+        await ensureD1Schema(env);
+        const body = await request.json().catch(()=>null);
+        const q = String(body?.query || "").trim();
+        if(!q) return jsonResponse({ ok:false, error:"no_query" }, 400);
+
+        let uid = q;
+        if(!/^\d+$/.test(uid)){
+          const username = q.replace(/^@/,"").toLowerCase();
+          const row = await env.BOT_DB.prepare("SELECT user_id FROM username_index WHERE username=?1").bind(username).first().catch(()=>null);
+          uid = row?.user_id ? String(row.user_id) : "";
+        }
+        if(!uid) return jsonResponse({ ok:false, error:"not_found" }, 404);
+
+        const st = patchUser((await getUser(uid, env))||{}, uid);
+        return jsonResponse({ ok:true, user:{
+          userId: st.userId,
+          username: st.username || "",
+          name: st.profileName || "",
+          phone: st.phone || "",
+          chatId: st.chatId || "",
+          timeframe: st.timeframe,
+          style: st.style,
+          risk: st.risk,
+          newsEnabled: !!st.newsEnabled,
+          experience: st.experience || "",
+          preferredMarket: st.preferredMarket || "",
+          level: st.level || "",
+          subActiveUntil: st.subActiveUntil || "",
+          points: st.points || 0,
+          invites: st.successfulInvites || 0,
+          referrerId: st.referrerId || "",
+          lastPaymentTx: st.lastPaymentTx || "",
+          lastPaymentStatus: st.lastPaymentStatus || "",
+          walletBalance: st.walletBalance || 0,
+          walletDepositRequests: st.walletDepositRequests || 0,
+          walletWithdrawRequests: st.walletWithdrawRequests || 0,
+          bep20Address: st.bep20Address || ""
+        }});
       }
 
       if (url.pathname === "/api/admin2/style/upsert" && request.method === "POST") {
@@ -1086,7 +1197,19 @@ function parseOrder(raw, fallbackArr){
   return s.split(",").map(x=>x.trim().toLowerCase()).filter(Boolean);
 }
 
-function sanitizeTimeframe(tf){ tf=String(tf||"").toUpperCase().trim(); return ["M15","H1","H4","D1"].includes(tf)?tf:null; }
+function sanitizeTimeframe(tf){
+  const raw = String(tf||"").trim();
+  const normalized = raw
+    .replace(/[۰٠]/g,"0").replace(/[۱١]/g,"1").replace(/[۲٢]/g,"2").replace(/[۳٣]/g,"3").replace(/[۴٤]/g,"4")
+    .replace(/[۵٥]/g,"5").replace(/[۶٦]/g,"6").replace(/[۷٧]/g,"7").replace(/[۸٨]/g,"8").replace(/[۹٩]/g,"9")
+    .replace(/\s+/g,"");
+  const upper = normalized.toUpperCase();
+  if(["M15","15M","15MIN","15MINUTE"].includes(upper)) return "M15";
+  if(["H1","1H","60M","60MIN","1HOUR","1HOURS"].includes(upper)) return "H1";
+  if(["H4","4H","240M","4HOUR","4HOURS","4ساعت","۴ساعت"].includes(upper) || /^(4|H4)$/.test(upper)) return "H4";
+  if(["D1","1D","1DAY","24H","24HOUR","24HOURS"].includes(upper)) return "D1";
+  return ["M15","H1","H4","D1"].includes(upper) ? upper : null;
+}
 function sanitizeStyle(s){
   s = String(s||"").trim();
   if(!s) return null;
@@ -1288,6 +1411,11 @@ async function ensureD1Schema(env){
         size INTEGER,
         active INTEGER NOT NULL DEFAULT 0,
         created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
       );
 CREATE TABLE IF NOT EXISTS payments (
   txid TEXT PRIMARY KEY,
@@ -1868,17 +1996,35 @@ const _CFG_VER = { ver:"0", exp:0 };
 async function getCfgVersion(env){
   const now = Date.now();
   if(_CFG_VER.exp > now) return _CFG_VER.ver;
-  if(!env || !env.BOT_KV){ _CFG_VER.ver = "0"; _CFG_VER.exp = now + 5000; return _CFG_VER.ver; }
-  const v = await env.BOT_KV.get("cfg:global_version").catch(()=>null);
-  _CFG_VER.ver = (v && String(v).trim()) ? String(v).trim() : "0";
-  _CFG_VER.exp = now + Math.min(5000, _cfgTtl(env));
+  if(env?.BOT_KV){
+    const v = await env.BOT_KV.get("cfg:global_version").catch(()=>null);
+    _CFG_VER.ver = (v && String(v).trim()) ? String(v).trim() : "0";
+    _CFG_VER.exp = now + Math.min(5000, _cfgTtl(env));
+    return _CFG_VER.ver;
+  }
+  if(hasD1(env)){
+    await ensureD1Schema(env);
+    const row = await env.BOT_DB.prepare("SELECT value FROM config WHERE key=?1").bind("__cfg_version").first().catch(()=>null);
+    _CFG_VER.ver = (row?.value && String(row.value).trim()) ? String(row.value).trim() : "0";
+    _CFG_VER.exp = now + Math.min(5000, _cfgTtl(env));
+    return _CFG_VER.ver;
+  }
+  _CFG_VER.ver = "0";
+  _CFG_VER.exp = now + 5000;
   return _CFG_VER.ver;
 }
 async function bumpCfgVersion(env){
-  if(!env || !env.BOT_KV) return;
-  await env.BOT_KV.put("cfg:global_version", String(Date.now())).catch(()=>{});
-  // also bust local cache immediately
-  _CFG_VER.ver = String(Date.now());
+  const next = String(Date.now());
+  if(env?.BOT_KV){
+    await env.BOT_KV.put("cfg:global_version", next).catch(()=>{});
+  }else if(hasD1(env)){
+    await ensureD1Schema(env);
+    await env.BOT_DB.prepare(
+      "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+    ).bind("__cfg_version", next, nowIso()).run().catch(()=>{});
+  }
+  _CFG_VER.ver = next;
   _CFG_VER.exp = Date.now() + 1000;
   _CFG_MEM.clear();
 }
@@ -1890,17 +2036,36 @@ async function getCfg(env, memKey, kvKey, envFallback=""){
   if(cached && cached.exp > now && cached.ver === curVer) return cached.v;
 
   let v = "";
-  if(env.BOT_KV) v = (await env.BOT_KV.get(kvKey)) || "";
+  if(hasD1(env)){
+    await ensureD1Schema(env);
+    const row = await env.BOT_DB.prepare("SELECT value FROM config WHERE key=?1").bind(kvKey).first().catch(()=>null);
+    if(row?.value !== undefined && row?.value !== null) v = String(row.value);
+  }
+  if(!v && env?.BOT_KV) v = (await env.BOT_KV.get(kvKey)) || "";
   if(!v) v = (envFallback || "").toString();
   v = String(v || "").trim();
+
+  if(v && hasD1(env)){
+    await env.BOT_DB.prepare(
+      "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+    ).bind(kvKey, v, nowIso()).run().catch(()=>{});
+  }
 
   _CFG_MEM.set(memKey, { v, exp: now + _cfgTtl(env), ver: curVer });
   return v;
 }
 async function setCfg(env, memKey, kvKey, value){
   const v = String(value || "").trim();
-  if(!env.BOT_KV) throw new Error("kv_missing");
-  await env.BOT_KV.put(kvKey, v);
+  if(!hasD1(env) && !env?.BOT_KV) throw new Error("storage_missing");
+  if(hasD1(env)){
+    await ensureD1Schema(env);
+    await env.BOT_DB.prepare(
+      "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+    ).bind(kvKey, v, nowIso()).run();
+  }
+  if(env?.BOT_KV) await env.BOT_KV.put(kvKey, v);
   await bumpCfgVersion(env);
   const curVer = await getCfgVersion(env);
   _CFG_MEM.set(memKey, { v, exp: Date.now() + _cfgTtl(env), ver: curVer });
@@ -5449,6 +5614,11 @@ const ADMIN_APP_HTML = `<!doctype html>
       </div>
 
       <div class="row" style="margin-top:10px">
+        <div class="col"><label>آدرس ولت اشتراک</label><input id="wallet" class="mono" placeholder="0x..." /></div>
+        <div class="col"><label>کمیسیون کلی (%)</label><input id="commissionRate" placeholder="مثلاً 10" /></div>
+      </div>
+
+      <div class="row" style="margin-top:10px">
         <div class="col"><label>سقف روزانه رایگان</label><input id="freeLimit" /></div>
         <div class="col"><label>سقف روزانه اشتراک</label><input id="subLimit" /></div>
         <div class="col"><label>سقف ماهانه</label><input id="monthlyLimit" /></div>
@@ -5543,6 +5713,48 @@ const ADMIN_APP_HTML = `<!doctype html>
         <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="commSave" class="primary">ذخیره</button></div>
       </div>
       <div class="muted" id="commMsg" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <div class="title" style="font-size:14px">📊 گزارش سریع</div>
+      <div class="muted">وضعیت کلی کاربران، پرداخت‌ها و کمیسیون‌ها</div>
+
+      <div class="hr"></div>
+
+      <div class="row">
+        <div class="col"><div class="pill">کل کاربران: <span id="repUsersTotal">—</span></div></div>
+        <div class="col"><div class="pill">اشتراک فعال: <span id="repUsersActive">—</span></div></div>
+        <div class="col"><div class="pill">پرداخت‌ها: <span id="repPaymentsTotal">—</span></div></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="col"><div class="pill">در انتظار: <span id="repPaymentsPending">—</span></div></div>
+        <div class="col"><div class="pill">تایید شده: <span id="repPaymentsApproved">—</span></div></div>
+        <div class="col"><div class="pill">رد شده: <span id="repPaymentsRejected">—</span></div></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="col"><div class="pill">درآمد تاییدشده: <span id="repRevenue">—</span></div></div>
+        <div class="col"><div class="pill">کمیسیون در انتظار: <span id="repCommissionDue">—</span></div></div>
+        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="repRefresh" class="ok">بروزرسانی</button></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title" style="font-size:14px">👤 اطلاعات کاربران</div>
+      <div class="muted">جستجو با ID یا یوزرنیم و نمایش آخرین کاربران</div>
+
+      <div class="hr"></div>
+
+      <div class="row">
+        <div class="col"><label>شناسه یا یوزرنیم</label><input id="userQuery" class="mono" placeholder="123456 یا @username" /></div>
+        <div class="col" style="min-width:180px"><label>&nbsp;</label><button id="userSearch" class="primary">جستجو</button></div>
+      </div>
+
+      <div class="muted" id="userDetail" style="margin-top:10px; white-space:pre-line"></div>
+
+      <div class="hr"></div>
+
+      <div class="muted" style="margin-bottom:6px">آخرین کاربران:</div>
+      <div class="muted" id="userList" style="white-space:pre-line"></div>
     </div>
   </div>
 
@@ -5649,6 +5861,12 @@ function updateBannerPreview(){
   $("bannerServe").textContent = url || "—";
 }
 
+function fmtNum(v){
+  if(v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toLocaleString("en-US") : String(v);
+}
+
 async function bootstrap(){
   const token = getToken();
   if(!token){
@@ -5665,12 +5883,14 @@ async function bootstrap(){
   setStatus("Online", true);
 
   const c = r.j.config || {};
+  $("wallet").value = c.wallet ?? "";
   $("price").value = c.price ?? "";
   $("currency").value = c.currency ?? "";
   $("days").value = c.days ?? "";
   $("freeLimit").value = c.freeLimit ?? "";
   $("subLimit").value = c.subLimit ?? "";
   $("monthlyLimit").value = c.monthlyLimit ?? "";
+  $("commissionRate").value = c.commissionRate ?? "";
 
   styles = Array.isArray(r.j.styles) ? r.j.styles : [];
   banners = Array.isArray(r.j.banners) ? r.j.banners : [];
@@ -5678,6 +5898,9 @@ async function bootstrap(){
   fillStyles();
   fillBanners();
   pickStyle($("stylePick").value);
+
+  await loadReport();
+  await loadUsers();
 
   toast("✅ وارد شدی");
 }
@@ -5730,12 +5953,14 @@ $("styleDelete").addEventListener("click", async ()=>{
 $("saveCfg").addEventListener("click", async ()=>{
   $("cfgMsg").textContent = "در حال ذخیره…";
   const payload = {
+    wallet: $("wallet").value,
     price: $("price").value,
     currency: $("currency").value,
     days: $("days").value,
     freeLimit: $("freeLimit").value,
     subLimit: $("subLimit").value,
     monthlyLimit: $("monthlyLimit").value,
+    commissionRate: $("commissionRate").value,
   };
   const r = await api("/api/admin2/config/set", payload);
   if(r.j?.ok){
@@ -5799,6 +6024,67 @@ $("commSave").addEventListener("click", async ()=>{
     toast(r.j?.error || "try_again");
   }
 });
+
+async function loadReport(){
+  const r = await api("/api/admin2/report/summary", {});
+  if(!r.j?.ok){
+    $("repUsersTotal").textContent = "—";
+    return;
+  }
+  const s = r.j.summary || {};
+  $("repUsersTotal").textContent = fmtNum(s.usersTotal);
+  $("repUsersActive").textContent = fmtNum(s.usersActiveSub);
+  $("repPaymentsTotal").textContent = fmtNum(s.paymentsTotal);
+  $("repPaymentsPending").textContent = fmtNum(s.paymentsPending);
+  $("repPaymentsApproved").textContent = fmtNum(s.paymentsApproved);
+  $("repPaymentsRejected").textContent = fmtNum(s.paymentsRejected);
+  $("repRevenue").textContent = fmtNum(s.revenue);
+  $("repCommissionDue").textContent = fmtNum(s.commissionDue);
+}
+
+function renderUserList(items){
+  const lines = (items || []).map(u=>{
+    const uname = u.username ? "@"+u.username : "-";
+    const sub = u.subActiveUntil ? ` | sub:${u.subActiveUntil}` : "";
+    return `• ${u.name || "-"} | ${uname} | ID:${u.userId}${sub}`;
+  });
+  $("userList").textContent = lines.join("\n") || "—";
+}
+
+async function loadUsers(){
+  const r = await api("/api/admin2/users/list", { limit: 30 });
+  if(!r.j?.ok){
+    $("userList").textContent = "خطا در دریافت کاربران";
+    return;
+  }
+  renderUserList(r.j.items || []);
+}
+
+async function fetchUser(){
+  const q = String($("userQuery").value||"").trim();
+  if(!q){ toast("شناسه یا یوزرنیم لازم است"); return; }
+  $("userDetail").textContent = "در حال دریافت…";
+  const r = await api("/api/admin2/user/get", { query: q });
+  if(!r.j?.ok){
+    $("userDetail").textContent = "کاربر پیدا نشد.";
+    return;
+  }
+  const u = r.j.user || {};
+  $("userDetail").textContent =
+`ID: ${u.userId || "-"}
+نام: ${u.name || "-"} | یوزرنیم: ${u.username ? "@"+u.username : "-"}
+شماره: ${u.phone || "-"} | چت: ${u.chatId || "-"}
+تنظیمات: TF=${u.timeframe || "-"} | Style=${u.style || "-"} | Risk=${u.risk || "-"} | News=${u.newsEnabled ? "ON" : "OFF"}
+سطح: ${u.level || "-"} | تجربه: ${u.experience || "-"} | بازار: ${u.preferredMarket || "-"}
+اشتراک تا: ${u.subActiveUntil || "-"}
+پرداخت اخیر: ${u.lastPaymentTx || "-"} (${u.lastPaymentStatus || "-"})
+امتیاز: ${fmtNum(u.points)} | دعوت: ${fmtNum(u.invites)}
+ولت: ${fmtNum(u.walletBalance)} | واریز: ${fmtNum(u.walletDepositRequests)} | برداشت: ${fmtNum(u.walletWithdrawRequests)}
+BEP20: ${u.bep20Address || "-"}`;
+}
+
+$("repRefresh").addEventListener("click", loadReport);
+$("userSearch").addEventListener("click", fetchUser);
 
 (function init(){
   const t = localStorage.getItem("admin_token") || "";
